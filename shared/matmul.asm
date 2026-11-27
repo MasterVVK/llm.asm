@@ -153,7 +153,7 @@ quantize_x_q8_0:
     lea     r9, [rel q8_xq]
     lea     r10, [rel q8_xs]
     lea     r11, [rel q8_xa]
-; quantize_core: rdi = x, rsi = K, r9 = xq, r10 = xs, r11 = xa.
+; quantize_core: rdi = x, rsi = K, r9 = xq, r10 = xs, r11 = xa (0 = skip |x|).
 ; Clobbers rax, rcx, rdx, r8 and SIMD registers only.
 quantize_core:
     mov     rcx, rsi
@@ -228,11 +228,13 @@ quantize_core:
 
     vmovdqa [r9 + rdx], xmm0            ; q8_xq[b*32 .. b*32+31]
     vmovdqa [r9 + rdx + 16], xmm2
+    test    r11, r11
+    jz      .qnext                      ; batch slots keep no |x|
     vpabsb  xmm0, xmm0
     vpabsb  xmm2, xmm2
     vmovdqa [r11 + rdx], xmm0           ; q8_xa[b*32 .. b*32+31]
     vmovdqa [r11 + rdx + 16], xmm2
-
+.qnext:
     add     r8, 128
     add     rdx, 32
     inc     rax
@@ -436,7 +438,7 @@ align 16
 %ifndef BARE_METAL
 ; ----------------------------------------------------------------------------
 ; void quantize_x_batch(const float *X, uint64 K, uint64 B, uint64 x_stride_bytes)
-; Quantizes B activation vectors into per-token slots q8b_xq / q8b_xa / q8b_xs
+; Quantizes B activation vectors into per-token slots q8b_xq / q8b_xs
 ; with exactly the same code as quantize_x_q8_0.
 ; ----------------------------------------------------------------------------
 quantize_x_batch:
@@ -458,8 +460,7 @@ quantize_x_batch:
     imul    rax, rbx, XQ_STRIDE
     lea     r9, [rel q8b_xq]
     add     r9, rax
-    lea     r11, [rel q8b_xa]
-    add     r11, rax
+    xor     r11d, r11d                  ; no |x| slot: the tiled kernel does not read it
     imul    rax, rbx, XS_STRIDE
     lea     r10, [rel q8b_xs]
     add     r10, rax
@@ -476,14 +477,48 @@ quantize_x_batch:
     ret
 
 ; ----------------------------------------------------------------------------
-; void matmul_q8_0_batch_range(const void *W, (unused), float *out, uint64 K,
-;                              uint64 r0, uint64 r1)
-; Batched prefill GEMM over g_mm_b tokens (v2 fp16 scales). For every row the
-; per-token dot product runs the very same instruction sequence as the GEMV
-; kernel, so results are bit-identical to token-by-token prefill; the row is
-; read from DRAM once and from L1 for the remaining tokens.
-; out[t * M + r] with the token stride M * 4 taken from g_mm_m4.
+; Batched prefill GEMM with a 1 row x 2 token register tile (v2 fp16 scales).
+; Per 32-byte block the pair shares |w|, and each token forms x * sign(w):
+; vpmaddubsw(|w|, x * sign(w)) yields exactly the int16 pair sums that the
+; GEMV kernel gets from vpmaddubsw(|x|, w * sign(x)) (all values are in
+; [-127, 127], so neither form saturates). The float part runs on ymm with
+; token A in the low and token B in the high 128 bits: one IEEE operation per
+; lane, in the GEMV order, so every output is bit-identical to
+; matmul_q8_0_range. Only q8b_xq / q8b_xs are read (|x| is not needed).
+;   ymm0..3  per-block accumulators [A | B]     ymm12  combined scales [A | B]
+;   xmm13/14 |w| halves   xmm15 int16 ones      xmm4..8 temporaries
 ; ----------------------------------------------------------------------------
+%macro PAIR_BLK 3                       ; byte offset in group, ymm acc, vpermilps imm
+    vpabsb     xmm14, [rax + %1]
+    vpabsb     xmm13, [rax + %1 + 16]
+    vmovdqu    xmm4, [r11 + %1]
+    vmovdqu    xmm5, [r11 + %1 + 16]
+    vpsignb    xmm4, xmm4, [rax + %1]
+    vpsignb    xmm5, xmm5, [rax + %1 + 16]
+    vpmaddubsw xmm4, xmm14, xmm4
+    vpmaddubsw xmm5, xmm13, xmm5
+    vpmaddwd   xmm4, xmm4, xmm15
+    vpmaddwd   xmm5, xmm5, xmm15
+    vpaddd     xmm4, xmm4, xmm5
+    vmovdqu    xmm5, [r11 + r12 + %1]
+    vmovdqu    xmm6, [r11 + r12 + %1 + 16]
+    vpsignb    xmm5, xmm5, [rax + %1]
+    vpsignb    xmm6, xmm6, [rax + %1 + 16]
+    vpmaddubsw xmm5, xmm14, xmm5
+    vpmaddubsw xmm6, xmm13, xmm6
+    vpmaddwd   xmm5, xmm5, xmm15
+    vpmaddwd   xmm6, xmm6, xmm15
+    vpaddd     xmm5, xmm5, xmm6
+    vinsertf128 ymm4, ymm4, xmm5, 1
+    vcvtdq2ps  ymm4, ymm4
+    vpermilps  ymm5, ymm12, %3
+    vmulps     ymm4, ymm4, ymm5
+    vaddps     %2, %2, ymm4
+%endmacro
+
+; void matmul_q8_0_batch_range(const void *W, unused, float *out, uint64 K,
+;                              uint64 r0, uint64 r1)
+; out[t * M + r] for t < g_mm_b, token stride M * 4 in g_mm_m4.
 matmul_q8_0_batch_range:
     push    rbx
     push    rbp
@@ -491,82 +526,111 @@ matmul_q8_0_batch_range:
     push    r13
     push    r14
     push    r15
-    sub     rsp, 8                      ; [rsp] = out pointer of token 0 for this row
+    sub     rsp, 40                     ; [rsp] out row, [+8] row base, [+16] xq A, [+24] xs A
 
     mov     rsi, r9
     sub     rsi, r8                     ; rows
-    jle     .b_exit
+    jle     .p_exit
     lea     rdx, [rdx + r8 * 4]
     mov     [rsp], rdx
     vmovdqa xmm15, [rel q8_one16x8]
     mov     r15, rcx                    ; K
-    mov     r13, rcx
-    and     r13, -128                   ; K_128
+    mov     rbx, rcx
+    and     rbx, -128                   ; K_128
     mov     r14, rcx
     shr     r14, 4
-    add     r14, rcx                    ; row_stride (fp16 scales)
+    add     r14, rcx                    ; row_stride
     mov     rax, r8
     imul    rax, r14
-    add     rax, rdi                    ; first row
+    add     rax, rdi
+    mov     [rsp + 8], rax
     mov     rcx, [rel g_mm_m4]          ; token stride in out (bytes)
 
-align 16
-.b_row:
-    lea     r8, [rax + r15]             ; fp16 scales of this row
+.p_row:
     mov     rdx, [rsp]
     lea     r11, [rel q8b_xq]
-    lea     r10, [rel q8b_xa]
     lea     rbp, [rel q8b_xs]
     mov     rdi, [rel g_mm_b]
-.b_tok:
-    vxorps  xmm0, xmm0, xmm0
-    vxorps  xmm1, xmm1, xmm1
-    vxorps  xmm2, xmm2, xmm2
-    vxorps  xmm3, xmm3, xmm3
-    xor     ebx, ebx
-    xor     r9d, r9d
-    test    r13, r13
-    jz      .b_tail
+.p_pair:
+    mov     r12d, XQ_STRIDE
+    mov     r13d, XS_STRIDE
+    cmp     rdi, 2
+    jae     .p_go
+    xor     r12d, r12d                  ; last odd token: B = A, B is not stored
+    xor     r13d, r13d
+.p_go:
+    mov     [rsp + 16], r11
+    mov     [rsp + 24], rbp
+    vxorps  ymm0, ymm0, ymm0
+    vxorps  ymm1, ymm1, ymm1
+    vxorps  ymm2, ymm2, ymm2
+    vxorps  ymm3, ymm3, ymm3
+    mov     rax, [rsp + 8]
+    lea     r8, [rax + r15]             ; fp16 scales of the row
+    lea     r9, [rax + rbx]             ; end of the 4-block part
+    mov     r10, r8                     ; end of the int8 part
+    cmp     rax, r9
+    jae     .p_tail
 align 16
-.b_blk4:
-    vmovq      xmm12, qword [r8 + r9]
-    vcvtph2ps  xmm12, xmm12
-    vmulps     xmm12, xmm12, [rbp + r9*2]
-    INT8_1ROW_4BLK
-    add     rbx, 128
-    add     r9, 8
-    cmp     rbx, r13
-    jb      .b_blk4
-.b_tail:
-    cmp     rbx, r15
-    jae     .b_red
-    movzx   r12d, word [r8 + r9]
-    vmovd   xmm12, r12d
-    vcvtph2ps xmm12, xmm12
-    vmulss  xmm12, xmm12, [rbp + r9*2]
-    INT8_BLK_AVX1 0, xmm0, 0x00
-    add     rbx, 32
-    add     r9, 2
-    jmp     .b_tail
-.b_red:
-    vaddps  xmm0, xmm0, xmm1
-    vaddps  xmm2, xmm2, xmm3
-    vaddps  xmm0, xmm0, xmm2
-    vhaddps xmm0, xmm0, xmm0
-    vhaddps xmm0, xmm0, xmm0
+.p_blk4:
+    Q8_PREFETCH [rax + r14]
+    Q8_PREFETCH [rax + r14 + 64]
+    vmovq      xmm7, qword [r8]
+    vcvtph2ps  xmm7, xmm7
+    vmulps     xmm12, xmm7, [rbp]
+    vmulps     xmm8, xmm7, [rbp + r13]
+    vinsertf128 ymm12, ymm12, xmm8, 1
+    PAIR_BLK 0,  ymm0, 0x00
+    PAIR_BLK 32, ymm1, 0x55
+    PAIR_BLK 64, ymm2, 0xAA
+    PAIR_BLK 96, ymm3, 0xFF
+    add     rax, 128
+    add     r11, 128
+    add     r8, 8
+    add     rbp, 16
+    cmp     rax, r9
+    jb      .p_blk4
+.p_tail:
+    cmp     rax, r10
+    jae     .p_red
+    movzx   r9d, word [r8]
+    vmovd   xmm7, r9d
+    vcvtph2ps xmm7, xmm7
+    vmulss  xmm12, xmm7, [rbp]
+    vmulss  xmm8, xmm7, [rbp + r13]
+    vinsertf128 ymm12, ymm12, xmm8, 1
+    PAIR_BLK 0, ymm0, 0x00
+    add     rax, 32
+    add     r11, 32
+    add     r8, 2
+    add     rbp, 4
+    jmp     .p_tail
+.p_red:
+    vaddps  ymm0, ymm0, ymm1
+    vaddps  ymm2, ymm2, ymm3
+    vaddps  ymm0, ymm0, ymm2
+    vhaddps ymm0, ymm0, ymm0
+    vhaddps ymm0, ymm0, ymm0
     vmovss  [rdx], xmm0
-    add     rdx, rcx
-    add     r11, XQ_STRIDE
-    add     r10, XQ_STRIDE
-    add     rbp, XS_STRIDE
-    dec     rdi
-    jnz     .b_tok
+    mov     r11, [rsp + 16]
+    mov     rbp, [rsp + 24]
+    test    r12, r12
+    jz      .p_row_done
+    vextractf128 xmm1, ymm0, 1
+    vmovss  [rdx + rcx], xmm1
+    lea     rdx, [rdx + rcx * 2]
+    add     r11, 2 * XQ_STRIDE
+    add     rbp, 2 * XS_STRIDE
+    sub     rdi, 2
+    jnz     .p_pair
+.p_row_done:
     add     qword [rsp], 4
-    add     rax, r14
+    add     [rsp + 8], r14
     dec     rsi
-    jnz     .b_row
-.b_exit:
-    add     rsp, 8
+    jnz     .p_row
+.p_exit:
+    vzeroupper
+    add     rsp, 40
     pop     r15
     pop     r14
     pop     r13
@@ -671,8 +735,6 @@ q8_xs:        resb (Q8_MAX_K / 32) * 4
 %ifndef BARE_METAL
 alignb 64
 q8b_xq:       resb MAX_BATCH * XQ_STRIDE
-alignb 64
-q8b_xa:       resb MAX_BATCH * XQ_STRIDE
 alignb 64
 q8b_xs:       resb MAX_BATCH * XS_STRIDE
 g_mm_b:       resq 1

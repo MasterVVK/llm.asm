@@ -1065,7 +1065,7 @@ msg_usage:
     db "  --raw                Do not wrap prompt in Qwen3 chat template", 10
     db "  --tokens <csv>       Pass exact comma-separated token IDs", 10
     db "  --temp <float>       Temperature (0.0 = greedy, default: 0.0)", 10
-    db "  --batch <n>          Prompt tokens per weight pass (default: 8, max: 16, 1 = per token)", 10
+    db "  --batch <n>          Prompt tokens per weight pass (default: 16, 1 = per token)", 10
     db "  --hugepages          Copy weights to 2 MiB transparent huge pages", 10
     db "  --topp <float>       Top-p threshold when temp > 0 (default: 0.95)", 10
     db "  --seed <uint>        PRNG seed for sampling (default: 42)", 10

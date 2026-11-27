@@ -4,7 +4,7 @@
 
 本项目将 [alesha-pro/llm.asm](https://github.com/alesha-pro/llm.asm)（上游提交 `48feccb`）移植到不支持 AVX2 和 FMA 的 x86-64 处理器上。它只需要 AVX 和 F16C，因此可以在 Intel Ivy Bridge（2012 年）及更新的处理器上运行，包括至今仍常见于家庭实验室和 Proxmox 集群的至强 E5 v2 服务器。上游版本要求 AVX2 + FMA（Haswell 或更新），在这些机器上会以 `Illegal instruction`（Linux）或 `[FATAL] CPU lacks AVX2+FMA`（裸机操作系统）退出。
 
-上游的两个程序都已移植：Linux 推理引擎（`build/asm-llm`，15,344 字节）和可引导的裸机操作系统（`build/asm-llm-os.elf`，24,888 字节）。
+上游的两个程序都已移植：Linux 推理引擎（`build/asm-llm`，19,144 字节）和可引导的裸机操作系统（`build/asm-llm-os.elf`，25,144 字节）。
 
 ## 改动内容
 
@@ -33,17 +33,28 @@
 | 16 | 51.4–54.4 | 39.9–40.9 | +29…33% | 65–69 | 200–223 |
 | 24 | 49.5 | 32.2 | +54% | 63.1 | 249 |
 
+此表中的预填充为逐个 token 处理，即移植版最初的测量结果；当前数据见[“批量预填充”](#批量预填充)一节。
+
 同一主机上无磁盘 Proxmox 虚拟机中的裸机操作系统（`results/proxmox-os-vm250.txt`）：内核启动耗时 170–180 毫秒，虚拟机启动 8 秒后出现提示符。在同一提示词下，其生成速度比 Linux 版本快：1 核快 24%，4 核快 12%，8 核快 4%，12 核快 5%；12 核时达到 55.4 token/秒。
 
 ## 批量预填充
 
-提示词按每批最多 16 个 token 处理（默认 8；`--batch n`，`--batch 1` 为逐个 token）。每一批中，每行权重只从内存读取一次，并用与单 token 内核完全相同的指令序列与该批所有 token 相乘，因此 KV 缓存和 logits 与逐 token 预填充逐位一致。34 个 token 提示词的预填充速度，Qwen3-0.6B，token/秒：
+提示词按每批最多 16 个 token 处理（`--batch n`，默认 16；`--batch 1` 为逐个 token）。每批使用“1 行 × 2 个 token”的寄存器分块内核：两个 token 共用每个 32 字节块的 |w|，每个 token 计算 x·sign(w)，因此 `vpmaddubsw(|w|, x·sign(w))` 得到的 int16 和与单 token 内核完全相同。浮点部分在 256 位寄存器中计算，每个 128 位半部分对应一个 token，所用的 IEEE 运算与单 token 内核相同。无论批大小和线程数如何，KV 缓存和 logits 都与逐 token 预填充逐位一致。线程通过原子计数器领取每块 16 行的任务，而不是使用预先划分的固定区间；当 vCPU 共用物理核心时，这样更快。
 
-| 线程数 | 逐个 token | 批量 | llama.cpp |
-|---:|---:|---:|---:|
-| 4 | 38 | 65 | 72 |
-| 8 | 55 | 106 | 145 |
-| 16 | 43 | 115 | 210 |
+单独测试内核，数据位于 L1（`ivybridge/kbench.asm`）：每行、每个 token、每个 32 值块需要 6.0–6.4 个周期，之前为 8.4–8.9。
+
+预填充速度，Qwen3-0.6B，token/秒（各 3 次；llama.cpp b12810，`llama-bench -p 34,227`，3 次重复的均值 ± 标准差；`results/prefill-tiles.txt`）：
+
+| 线程数 | 34 个 token：本移植版 | 34 个 token：llama.cpp | 227 个 token：本移植版 | 227 个 token：llama.cpp |
+|---:|---:|---:|---:|---:|
+| 1 | 24–28 | 21.6 | 27.4–27.9 | 21.0 |
+| 4 | 83–91 | 75 | 88–93 | 75.5 |
+| 8 | 146–150 | 124 ± 19 | 155–163 | 145 |
+| 16 | 183–194 | 248 ± 19 | 236–251 | 240 |
+
+第一版批量预填充（每次处理一行和一个 token，线程使用固定区间，每批 8 个 token）在 227 个 token 的提示词上，1 / 4 / 8 / 16 线程分别为 20 / 70 / 125–130 / 141–183 token/秒。
+
+短提示词在 16 线程下能看出其余工作的开销：每个 token 的注意力、归一化和残差加法在矩阵乘法批次之间执行，其中一部分只用一个线程。
 
 ## 更大的 Qwen3 模型
 
@@ -59,11 +70,22 @@
 | 4B | 8 | 8.4 | 7.3 | +16% |
 | 4B | 16 | 8.8 | 7.8 | +13% |
 
-预填充仍比 llama.cpp 慢 1.4–3.4 倍。`--hugepages` 会把权重复制到 2 MiB 透明大页中：1.7B 和 4B 在 4 线程时提升 8%，8–16 线程时没有提升，因此默认关闭。
+227 个 token 提示词的批量预填充速度，token/秒（本移植版取 3 次的中位数；llama.cpp 为 `llama-bench -p 227` 3 次的均值；`results/prefill-tiles.txt`）：
+
+| 模型 | 线程数 | 本移植版 | llama.cpp | 提升 |
+|---|---:|---:|---:|---:|
+| 1.7B | 4 | 34.2 | 26.0 | +32% |
+| 1.7B | 8 | 65.3 | 48.8 | +34% |
+| 1.7B | 16 | 106.5 | 71.5 | +49% |
+| 4B | 4 | 13.5 | 10.2 | +32% |
+| 4B | 8 | 25.9 | 19.7 | +32% |
+| 4B | 16 | 45.0 | 33.1 | +36% |
+
+`--hugepages` 会把权重复制到 2 MiB 透明大页中：1.7B 和 4B 在 4 线程时提升 8%，8–16 线程时没有提升，因此默认关闭。
 
 ## 局限
 
-- 预填充已改为批处理（见上文），但在 4–16 线程下仍比 llama.cpp 慢 1.1–1.8 倍。
+- 预填充（见上文）在 1–8 线程下快于 llama.cpp；在 227 个 token 的提示词上，16 线程时与其持平；在 34 个 token 的提示词上，16 线程时 llama.cpp 快约 30%。
 - 仅支持 Qwen3-0.6B：模型结构写死在代码中，上下文最多 2048 个 token，不支持 GPU，也没有网络 API。
 - **裸机操作系统即使空闲也会让所有 vCPU 保持 100% 占用**：工作核心在 `pause` 循环中等待，没有使用 `hlt`。在共享的虚拟化主机上，只在使用时运行它。
 - 在 Linux 下，`-t` 不要超过空闲核心数。默认是 32 个线程，在繁忙的机器上吞吐量会下降一个数量级以上（上游 issue #9 和 #10）。
@@ -77,6 +99,9 @@ python3 scripts/test_math.py build/test_math
 nasm -f elf64 -DFAST_Q8=1 -Ishared/ ivybridge/test_matmul_k.asm -o build/test_matmul_k.o
 ld --gc-sections -s -z noexecstack build/test_matmul_k.o build/syscalls.o build/matmul.o -o build/test_matmul_k
 python3 ivybridge/test_matmul_k.py build/test_matmul_k
+nasm -f elf64 -DFAST_Q8=1 -Ishared/ ivybridge/kbench.asm -o build/kbench.o
+ld --gc-sections -z noexecstack build/kbench.o build/matmul.o -o build/kbench
+python3 ivybridge/kbench.py build/kbench   # 内核每行、每个 token、每个块的周期数
 # 模型导出：见 01-qwen3-inference/README.md
 ivybridge/bench.sh build/asm-llm models/qwen3-0.6b-q8_0.asmbin /path/to/llama-bench /path/to/Qwen3-0.6B-Q8_0.gguf "1 4 8 16" 3 out.csv
 ```

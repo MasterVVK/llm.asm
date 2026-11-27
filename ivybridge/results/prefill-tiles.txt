@@ -1,0 +1,42 @@
+# Batched prefill with the 1 row x 2 token register tile and dynamic 16-row chunks,
+# Qwen3-0.6B Q8_0. Xeon E5-2696 v2 host, 32-vCPU KVM guest. Tokens per second;
+# asm-llm --batch 16 (default), 3 runs; llama.cpp b12810:
+# llama-bench -p 34,227 -n 64 -r 3 -ngl 0 (mean, sd).
+threads  asm_pp34              asm_pp227             asm_tg64            llama_pp34      llama_pp227     llama_tg64
+1        27.83 25.98 24.48     27.43 27.38 27.86     11.35 9.47 9.40     21.61 (0.52)    20.97 (0.27)    8.38 (0.02)
+4        89.51 90.79 83.21     93.39 89.66 87.69     31.86 33.98 32.07   75.03 (2.91)    75.52 (2.03)    26.01 (0.42)
+8        146.19 150.03 148.90  160.01 163.49 154.91  49.98 48.61 50.07   124.10 (19.06)  145.05 (2.04)   39.36 (0.33)
+16       182.96 189.06 194.12  250.84 244.75 235.50  53.79 53.77 53.30   248.44 (19.30)  240.47 (9.47)   39.11 (0.37)
+
+# Same session, 227-token prompt: first batched version (1 row x 1 token, static
+# slices, batch 8) against the tile kernel at batch 8 / 12 / 16.
+threads  first                  tile_b8                tile_b12               tile_b16
+1        20.17 20.41 20.94      27.01 27.13 27.32      27.88 28.54 27.79      28.02 28.01 27.02
+4        69.76 69.56 70.27      85.49 86.09 85.76      90.12 90.72 86.46      91.40 89.98 91.22
+8        124.56 125.97 130.36   149.07 149.87 146.50   151.25 152.75 157.77   159.91 158.61 155.89
+16       182.71 172.65 140.89   214.04 221.13 213.88   221.86 229.06 234.08   241.98 227.79 228.57
+
+# Dynamic chunks alone (first kernel, batch 8), 227-token prompt:
+# 16 threads 177.18 189.84 185.80 192.32 182.71 vs static slices 172.52 153.68 160.51 157.04 168.68;
+# 8 threads 123.41 126.51 127.34 121.38 124.48 vs 120.17 130.84 118.73 121.14 129.64.
+
+# Kernel alone (ivybridge/kbench.asm), cycles per (row, token, 32-value block), ~3.0 GHz.
+K     M   B   gemv  first_batch  tile_1x2
+1024  8   8   9.24  8.86         6.44
+1024  8   4   8.06  8.41         6.05
+3072  4   8   7.77  8.38         5.97
+1024  64  8   8.63  8.73         6.28
+3072  64  8   8.27  8.78         6.35
+
+# Time outside the batched GEMM before the tile kernel, 227-token prompt, ms:
+# 1 thread: full 10835 11172 10958, GEMM skipped 925 894 924;
+# 16 threads: full 1185 1213 1235, GEMM skipped 326 316 316 (of which attention ~180, quantization ~100).
+
+# Larger models, 227-token prompt, tokens per second (asm-llm 3 runs; llama-bench -p 227 -n 0 -r 3, mean, sd).
+model  threads  asm_pp227             llama_pp227
+1.7B   4        34.05 34.61 34.21     26.01 (0.27)
+1.7B   8        65.29 66.58 65.00     48.79 (0.44)
+1.7B   16       106.79 106.50 103.90  71.52 (3.83)
+4B     4        13.49 13.50 13.57     10.21 (0.09)
+4B     8        25.52 25.91 25.99     19.67 (0.29)
+4B     16       45.15 45.04 45.03     33.08 (0.70)

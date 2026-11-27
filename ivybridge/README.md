@@ -4,7 +4,7 @@
 
 A port of [alesha-pro/llm.asm](https://github.com/alesha-pro/llm.asm) (upstream commit `48feccb`) to x86-64 CPUs without AVX2 and FMA. It needs only AVX and F16C, so it runs on Intel Ivy Bridge (2012) and newer, including the Xeon E5 v2 servers that are still common in homelabs and Proxmox clusters. Upstream requires AVX2 + FMA (Haswell or newer) and on these machines stops with `Illegal instruction` (Linux) or `[FATAL] CPU lacks AVX2+FMA` (bare-metal OS).
 
-Both upstream programs are ported: the Linux inference engine (`build/asm-llm`, 15,344 bytes) and the bootable bare-metal OS (`build/asm-llm-os.elf`, 24,888 bytes).
+Both upstream programs are ported: the Linux inference engine (`build/asm-llm`, 19,144 bytes) and the bootable bare-metal OS (`build/asm-llm-os.elf`, 25,144 bytes).
 
 ## What changed
 
@@ -33,17 +33,28 @@ Hardware: a Proxmox VE 8.4 host with 2× Xeon E5-2696 v2 (Ivy Bridge-EP, 12 core
 | 16 | 51.4–54.4 | 39.9–40.9 | +29…33% | 65–69 | 200–223 |
 | 24 | 49.5 | 32.2 | +54% | 63.1 | 249 |
 
+Prefill in this table is token by token, as first measured for the port; current numbers are under [Batched prefill](#batched-prefill).
+
 Bare-metal OS in a diskless Proxmox VM on the same host (`results/proxmox-os-vm250.txt`): the kernel boots in 170–180 ms and the prompt appears 8 s after the VM starts. On the same prompt it decodes faster than the Linux build by 24% with 1 core, 12% with 4, 4% with 8 and 5% with 12 cores, reaching 55.4 tok/s at 12 cores.
 
 ## Batched prefill
 
-The prompt is processed in passes of up to 16 tokens (default 8; `--batch n`, `--batch 1` = one token at a time). Each weight row is read from memory once per pass and multiplied with every token of the pass by the same instruction sequence as the single-token kernel, so the KV cache and the logits are bit-identical to token-by-token prefill. Prefill of the 34-token prompt, Qwen3-0.6B, tokens per second:
+The prompt is processed in passes of up to 16 tokens (`--batch n`, default 16; `--batch 1` = one token at a time). The pass kernel is a 1 row × 2 token register tile: both tokens share |w| of each 32-byte block, and each token forms x·sign(w), so `vpmaddubsw(|w|, x·sign(w))` gives exactly the int16 sums of the single-token kernel. The float part runs in 256-bit registers, one token in each 128-bit half, with the same IEEE operations as the single-token kernel. The KV cache and the logits are bit-identical to token-by-token prefill at any batch size and thread count. Threads claim 16-row chunks through an atomic counter instead of fixed slices, which helps when vCPUs share physical cores.
 
-| Threads | Token by token | Batched | llama.cpp |
-|---:|---:|---:|---:|
-| 4 | 38 | 65 | 72 |
-| 8 | 55 | 106 | 145 |
-| 16 | 43 | 115 | 210 |
+Kernel alone, data in L1 (`ivybridge/kbench.asm`): 6.0–6.4 cycles per row, token and 32-value block, down from 8.4–8.9.
+
+Prefill, Qwen3-0.6B, tokens per second (3 runs; llama.cpp b12810, `llama-bench -p 34,227`, mean ± sd of 3 repetitions; `results/prefill-tiles.txt`):
+
+| Threads | 34 tokens: this port | 34 tokens: llama.cpp | 227 tokens: this port | 227 tokens: llama.cpp |
+|---:|---:|---:|---:|---:|
+| 1 | 24–28 | 21.6 | 27.4–27.9 | 21.0 |
+| 4 | 83–91 | 75 | 88–93 | 75.5 |
+| 8 | 146–150 | 124 ± 19 | 155–163 | 145 |
+| 16 | 183–194 | 248 ± 19 | 236–251 | 240 |
+
+The first batched version (one row and one token at a time, fixed slices, 8 tokens per pass) reached 20 / 70 / 125–130 / 141–183 tok/s on the 227-token prompt at 1 / 4 / 8 / 16 threads.
+
+On the short prompt at 16 threads the rest of the work shows: attention, norms and residual adds run per token between the matrix passes, partly on one thread.
 
 ## Larger Qwen3 models
 
@@ -59,11 +70,22 @@ The same engine runs Qwen3-1.7B and Qwen3-4B; `scripts/export_weights.py` now re
 | 4B | 8 | 8.4 | 7.3 | +16% |
 | 4B | 16 | 8.8 | 7.8 | +13% |
 
-Prefill stays 1.4–3.4× slower than llama.cpp. `--hugepages` copies the weights into 2 MiB transparent huge pages: +8% at 4 threads for 1.7B and 4B, no gain at 8–16 threads, so it is off by default.
+Prefill of the 227-token prompt in batched passes, tokens per second (median of 3; llama.cpp `llama-bench -p 227`, mean of 3; `results/prefill-tiles.txt`):
+
+| Model | Threads | This port | llama.cpp | Gain |
+|---|---:|---:|---:|---:|
+| 1.7B | 4 | 34.2 | 26.0 | +32% |
+| 1.7B | 8 | 65.3 | 48.8 | +34% |
+| 1.7B | 16 | 106.5 | 71.5 | +49% |
+| 4B | 4 | 13.5 | 10.2 | +32% |
+| 4B | 8 | 25.9 | 19.7 | +32% |
+| 4B | 16 | 45.0 | 33.1 | +36% |
+
+`--hugepages` copies the weights into 2 MiB transparent huge pages: +8% at 4 threads for 1.7B and 4B, no gain at 8–16 threads, so it is off by default.
 
 ## Limitations
 
-- Prefill is batched (see above) but still 1.1–1.8× slower than llama.cpp at 4–16 threads.
+- Prefill (see above) is faster than llama.cpp at 1–8 threads and on par at 16 threads on a 227-token prompt; on the 34-token prompt llama.cpp is about 30% faster at 16 threads.
 - Qwen3-0.6B only: the architecture is hard-coded, the context is limited to 2048 tokens, and there is no GPU support or network API.
 - **The bare-metal OS keeps all of its vCPUs at 100% even when idle**: worker cores wait in a `pause` loop and there is no `hlt`. On a shared hypervisor, run it only while you use it.
 - Under Linux, do not set `-t` above the number of free cores. The default is 32 threads, and on a busy machine throughput drops by more than an order of magnitude (upstream issues #9 and #10).
@@ -77,6 +99,9 @@ python3 scripts/test_math.py build/test_math
 nasm -f elf64 -DFAST_Q8=1 -Ishared/ ivybridge/test_matmul_k.asm -o build/test_matmul_k.o
 ld --gc-sections -s -z noexecstack build/test_matmul_k.o build/syscalls.o build/matmul.o -o build/test_matmul_k
 python3 ivybridge/test_matmul_k.py build/test_matmul_k
+nasm -f elf64 -DFAST_Q8=1 -Ishared/ ivybridge/kbench.asm -o build/kbench.o
+ld --gc-sections -z noexecstack build/kbench.o build/matmul.o -o build/kbench
+python3 ivybridge/kbench.py build/kbench   # kernel cycles per row, token and block
 # model export: see 01-qwen3-inference/README.md
 ivybridge/bench.sh build/asm-llm models/qwen3-0.6b-q8_0.asmbin /path/to/llama-bench /path/to/Qwen3-0.6B-Q8_0.gguf "1 4 8 16" 3 out.csv
 ```

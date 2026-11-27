@@ -160,7 +160,7 @@
 
 ; Batched prefill buffers (MAX_BATCH tokens per pass, all inside the arena)
 %define MAX_BATCH           16
-%define DEFAULT_BATCH       8           ; best measured on Ivy Bridge: x fits L1 even for K = 3072
+%define DEFAULT_BATCH       16          ; best measured on Ivy Bridge with the 1x2 tile kernel
 %define CTX_BUF_BX          376         ; [MAX_BATCH][dim]
 %define CTX_BUF_BXB         384         ; [MAX_BATCH][dim]
 %define CTX_BUF_BQKV        392         ; [MAX_BATCH][q_dim + 2 * kv_dim]

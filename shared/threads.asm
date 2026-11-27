@@ -161,10 +161,15 @@ tp_init:
     jne     .worker_exit
     mov     r13d, eax                   ; latch new generation
 
+%if FAST_Q8
+    ; Dynamic work: claim chunks until the job is exhausted (fast threads take
+    ; more; every row is still computed by one thread with the same code)
+    call    tp_run_chunks
+%else
     ; Deterministic balanced row/head slice [r0, r1) for tid = r12
     mov     rcx, [rel tp_M]
     mov     r8, [rel tp_n_threads]
-%if FAST_Q8
+%if 0
     ; Ceiling-balanced partitioning: r0 = (tid*M + N - 1) / N, r1 = ((tid+1)*M + N - 1) / N
     ; Guarantees tid=0 always gets work first and 1-row/1-head balance across 1..64T.
     lea     r9, [r8 - 1]                ; N - 1
@@ -240,6 +245,7 @@ tp_init:
     call    gqa_attn_range
 %endif
 
+%endif
 .job_done:
     ; Lock-free TSO release store to worker's private 64B cache line!
     lea     rax, [rel tp_done_arr]
@@ -253,6 +259,55 @@ tp_init:
     mov     eax, SYS_exit
     syscall
     hlt
+
+%if FAST_Q8
+; ----------------------------------------------------------------------------
+; tp_run_chunks: claim chunks of the published job with LOCK XADD until none
+; remain. Matmul jobs: 2^tp_chunk_shift rows per chunk; attention: one head.
+; ----------------------------------------------------------------------------
+tp_run_chunks:
+    push    rbx
+.rc_lp:
+    mov     eax, 1
+    lock xadd dword [rel tp_next], eax  ; claimed chunk index
+    mov     rcx, [rel tp_K]
+    test    rcx, rcx
+    jz      .rc_attn
+    mov     ecx, [rel tp_chunk_shift]
+    mov     r8, rax
+    shl     r8, cl                      ; r0
+    cmp     r8, [rel tp_M]
+    jae     .rc_done
+    mov     r9d, 1
+    shl     r9, cl
+    add     r9, r8                      ; r1 = min(r0 + rows, M)
+    cmp     r9, [rel tp_M]
+    cmova   r9, [rel tp_M]
+    mov     rdi, [rel tp_W]
+    mov     rsi, [rel tp_x]
+    mov     rdx, [rel tp_out]
+    mov     rcx, [rel tp_K]
+    cmp     dword [rel tp_mode], 0
+    jne     .rc_batch
+    call    matmul_q8_0_range
+    jmp     .rc_lp
+.rc_batch:
+    call    matmul_q8_0_batch_range
+    jmp     .rc_lp
+.rc_attn:
+    mov     rcx, rax                    ; h0
+    cmp     rcx, [rel tp_M]
+    jae     .rc_done
+    lea     r8, [rcx + 1]               ; h1
+    mov     rdi, [rel tp_W]
+    mov     rsi, [rel tp_x]
+    mov     rdx, [rel tp_out]
+    call    gqa_attn_range
+    jmp     .rc_lp
+.rc_done:
+    pop     rbx
+    ret
+%endif
 
 ; ----------------------------------------------------------------------------
 ; void tp_shutdown(void)
@@ -310,6 +365,15 @@ tp_matmul_q8_0:
     mov     [rel tp_out], rdx
     mov     [rel tp_M], rcx
     mov     [rel tp_K], r8
+%if FAST_Q8
+    mov     dword [rel tp_next], 0
+    mov     eax, 4                      ; 16-row chunks
+    cmp     rcx, 8192
+    jbe     .chunk_ok
+    mov     eax, 6                      ; 64-row chunks for the LM head (fewer atomics)
+.chunk_ok:
+    mov     [rel tp_chunk_shift], eax
+%endif
 
     ; Release barrier: atomically increment generation and capture new gen in r12d
     mov     r12d, 1
@@ -328,6 +392,10 @@ tp_matmul_q8_0:
     syscall
 
 .run_main_slice:
+%if FAST_Q8
+    call    tp_run_chunks
+    jmp     .wait_workers
+%else
     mov     rax, [rel tp_M]
 %if FAST_Q8
     lea     rax, [rax + rbx - 1]
@@ -370,6 +438,7 @@ tp_matmul_q8_0:
     call    gqa_attn_range
 %endif
 
+%endif
 .wait_workers:
     ; Wait for each worker tid = 1 .. n_threads-1 to store new_gen in its cache line
     lea     rdi, [rel tp_done_arr]
@@ -460,6 +529,7 @@ tp_gqa_attn:
     mov     [rel tp_out], rdx
     mov     [rel tp_M], rcx
     mov     qword [rel tp_K], 0         ; K == 0 -> gqa_attn_range job
+    mov     dword [rel tp_next], 0
 
     mov     r12d, 1
     lock xadd dword [rel tp_gen], r12d
@@ -494,6 +564,11 @@ tp_out:       resq 1
 tp_M:         resq 1
 tp_K:         resq 1
 tp_mode:      resd 1                    ; 0 = GEMV, 1 = batched prefill GEMM
+tp_chunk_shift: resd 1                  ; log2(rows per claimed chunk)
+
+alignb 64
+tp_next:      resd 1                    ; next chunk index (own cache line)
+resb 60
 
 alignb 64
 tp_waiters:   resd 1
