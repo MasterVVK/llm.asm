@@ -108,4 +108,6 @@ if __name__ == '__main__':
             top1 = int(np.argmax(scores))
             ref_top = np.argsort(ref)[-5:][::-1].tolist()
             print(f'step={step} correlation={corr:.6f} RMSE={rmse:.5f} native={top1} BF16_top5={ref_top}', flush=True)
-            assert top1 == generated[step] and top1 in ref_top and corr > .99
+            assert top1 == generated[step] == ref_top[0], (step, top1, generated[step], ref_top)
+            assert corr > .99, (step, corr)
+        print("PASS: native greedy IDs match BF16 top-1 at all three positions")
