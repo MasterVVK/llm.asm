@@ -153,7 +153,8 @@
         .equ CTX_BUF_BGU,       376             // [MAX_BATCH][2 hidden_dim]
         .equ CTX_BUF_BCOS,      384             // [MAX_BATCH][head_dim / 2]
         .equ CTX_BUF_BSIN,      392
-        .equ CTX_N_BUFS,        24
+        .equ CTX_BUF_BSCR,      400             // [MAX_BATCH][n_heads][max_seq] attention scores
+        .equ CTX_N_BUFS,        25
         .equ CTX_SIZE,          448
 
 // adrp + add for a symbol in a static executable

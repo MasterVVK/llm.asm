@@ -23,6 +23,7 @@
         .global tp_init, tp_matmul, tp_attn, tp_n_threads, g_mm_delta, tp_n_little, tp_chunk_shift
         .global tp_matmul_batch, tp_main_variant
         .global tp_kv_base, tp_pos, tp_scale, tp_gqa
+        .global tp_attn_batch, tp_ab_b
 
 // void tp_init(uint64 n x0) — spawns n-1 workers (n clamped to [1, MAX_THREADS])
 // n = 0 picks the thread count automatically: one per big core of the
@@ -224,6 +225,8 @@ tp_run_chunks:
         ldr     w7, [x19, #JOB_KIND]
         cmp     w7, #1
         b.eq    2f
+        cmp     w7, #4
+        b.eq    7f
         // matmul rows [c*CH, min((c+1)*CH, M))
         ADR_L   x5, tp_chunk_shift
         ldr     x5, [x5]
@@ -255,6 +258,9 @@ tp_run_chunks:
         b       1b
 2:      mov     x0, x2                  // attention head
         bl      gqa_attn_head
+        b       1b
+7:      mov     x0, x2                  // two heads of one token of the batch
+        bl      attn_pair_item
         b       1b
 9:      ldr     x21, [sp, #32]
         ldp     x19, x20, [sp, #16]
@@ -447,6 +453,32 @@ tp_attn:
         ldp     x29, x30, [sp], #32
         ret
 
+// void tp_attn_batch(uint64 n_items x0) — batched prefill attention:
+// attn_pair_item(i) for every i < n_items, claimed dynamically by the pool.
+tp_attn_batch:
+        stp     x29, x30, [sp, #-32]!
+        stp     x19, x20, [sp, #16]
+        mov     x19, x0
+        ADR_L   x0, tp_n_threads
+        ldr     x0, [x0]
+        cmp     x0, #1
+        b.gt    2f
+        mov     x20, #0
+1:      cmp     x20, x19
+        b.hs    3f
+        mov     x0, x20
+        bl      attn_pair_item
+        add     x20, x20, #1
+        b       1b
+2:      ADR_L   x0, tp_job
+        mov     w1, #4
+        str     w1, [x0, #JOB_KIND]
+        str     w19, [x0, #JOB_NCHUNKS]
+        bl      tp_dispatch
+3:      ldp     x19, x20, [sp, #16]
+        ldp     x29, x30, [sp], #32
+        ret
+
         .bss
         .balign 64
 tp_n_threads: .skip 8
@@ -462,6 +494,7 @@ tp_kv_base: .skip 8
 tp_pos:     .skip 8
 tp_scale:   .skip 4
 tp_gqa:     .skip 4
+tp_ab_b:    .skip 8                     // tokens in the batch (batched attention)
         .balign 8
 g_mm_delta: .skip 8                     // repacked_base - mmap_base (0 = row kernel)
 tp_main_variant: .skip 8

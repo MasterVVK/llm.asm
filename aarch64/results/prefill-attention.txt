@@ -1,0 +1,36 @@
+# Batched prefill attention, Qwen3-0.6B Q8_0, CM3588 (RK3588), default DDR governor.
+# One pool job per layer for the whole pass; a chunk is two query heads of one token
+# (aarch64/transformer.s, attn_pair_item). Logits are bit-identical to the previous
+# version and to --batch 1 on every core set (md5 of the 34-token prompt logits:
+# 98b4171a162a99e8e69ac21845bd8001, same as before).
+
+# Previous version (e4fb517) and this one run alternately, every run started below 65 C.
+# Tokens per second, 3 runs each; --batch 16 (default), taskset per core set.
+cores   prompt  previous              batched_attention
+4xA76   34      178.36 177.33 175.10  176.67 175.49 172.70
+4xA76   227     179.03 180.12 179.12  203.29 192.89 202.20
+1xA76   34      56.32 56.46 54.50     56.31 56.83 52.80
+1xA76   227     49.25 49.58 49.51     54.39 53.29 53.96
+4xA55   34      35.63 37.40 38.07     37.46 39.64 38.55
+4xA55   227     36.09 36.08 35.59     38.88 38.76 38.90
+
+# Chunk order. With head pairs varying fastest (token-major order) every chunk reads
+# the K/V rows of another kv head, they do not survive in the 512 KB L2 of an A76,
+# and on one A76 the gain was nil (227 tokens: 49.7 -> 49.7 tok/s). With the tokens
+# of one head pair in consecutive chunks: 49.5 -> 53.6.
+
+# Where attention time goes, 227-token prompt, ms per prefill (3 runs).
+# no attention = the pool job is skipped; the other variants skip one part of the kernel.
+1xA76  batched attention                4189 4191 4219
+1xA76  no attention                     3729 3764 3791
+1xA76  scores and softmax only (no V)   3921 3969 3970
+1xA76  no softmax                       4044 4175 4185
+1xA76  V loop always on one row (L1)    4065 4090 4107
+4xA76  batched attention                1161 1162 1163
+4xA76  no attention                     1017 1017 1018
+4xA55  batched attention                5793 5795 5802
+4xA55  no attention                     5251 5257 5302
+# 1xA76: attention 0.44 s (previous version 0.83 s): scores ~0.13 s, softmax ~0.06 s,
+# weighted sum of V ~0.25 s, about half of it waiting for V rows from L2.
+# Tried without effect (within 1%): ld1r + vector FMLA instead of FMLA by element,
+# software prefetch of V rows 4 or 8 positions ahead.

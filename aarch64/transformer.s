@@ -8,6 +8,7 @@
 
         .text
         .global g_ctx, model_init, transformer_forward, gqa_attn_head, transformer_forward_batch
+        .global attn_pair_item
 
         .macro ALIGN64 reg
         add     \reg, \reg, #63
@@ -204,6 +205,12 @@ model_init:
         mul     x1, x1, x2
         ALLOC   CTX_BUF_BCOS, x1
         ALLOC   CTX_BUF_BSIN, x1
+        ldr     x1, [x19, #CTX_N_HEADS]
+        ldr     x3, [x19, #CTX_MAX_SEQ]
+        mul     x1, x1, x3
+        lsl     x1, x1, #2              // scores of every head of every token
+        mul     x1, x1, x2
+        ALLOC   CTX_BUF_BSCR, x1
         ALIGN64 x20
         str     x20, [x19, #CTX_ARENA_SIZE]
         mov     x0, x20
@@ -595,9 +602,10 @@ transformer_forward:
 // void transformer_forward_batch(const uint32 *toks x0, uint64 B x1, uint64 pos0 x2,
 //                                int compute_logits x3)
 // Prompt prefill of B <= MAX_BATCH tokens at pos0 .. pos0 + B - 1: weights are
-// streamed once per layer for the batch (tp_matmul_batch), all other steps run
-// the single-token code per token, and token t attends to 0 .. pos0 + t after
-// the whole batch is in the KV cache. Bit-identical to B transformer_forward calls.
+// streamed once per layer for the batch (tp_matmul_batch), the attention of all
+// tokens is one pool job (attn_pair_item), and token t attends to 0 .. pos0 + t
+// after the whole batch is in the KV cache. Norms, RoPE and residual adds run
+// the single-token code per token. Bit-identical to B transformer_forward calls.
         .equ FB_TOKS,     96
         .equ FB_POS0,     104
         .equ FB_LOGITS,   112
@@ -612,7 +620,8 @@ transformer_forward:
         .equ FB_QKVM,     184
         .equ FB_SAVE_Q,   192
         .equ FB_SAVE_ATT, 200
-        .equ FB_SZ,       208
+        .equ FB_PAIR,     208             // 1 = batched attention kernel applies
+        .equ FB_SZ,       224
 transformer_forward_batch:
         stp     x29, x30, [sp, #-FB_SZ]!
         stp     x19, x20, [sp, #16]
@@ -638,6 +647,11 @@ transformer_forward_batch:
         udiv    x0, x0, x1
         ADR_L   x9, tp_gqa
         str     w0, [x9]
+        and     x1, x0, #1              // attn_pair_item needs pairs of query
+        cmp     x22, #128               // heads per kv head and head_dim 128
+        ccmp    x1, #0, #0, eq
+        cset    x1, eq
+        str     x1, [sp, #FB_PAIR]
         ldr     x0, [x19, #CTX_Q_DIM]
         ldr     x1, [x19, #CTX_KV_DIM]
         add     x0, x0, x1, lsl #1
@@ -822,7 +836,21 @@ transformer_forward_batch:
         b.ne    50b
         add     x23, x23, #1
         b       5b
-8:      // attention per token: point buf_q / buf_att_out at token t (no copies)
+8:      // attention of the whole batch in one pool job: a chunk is a pair of
+        // query heads of one token
+        ldr     x0, [sp, #FB_PAIR]
+        cbz     x0, 80f
+        ldr     x0, [sp, #FB_POS0]
+        ADR_L   x9, tp_pos
+        str     x0, [x9]
+        ADR_L   x9, tp_ab_b
+        str     x20, [x9]
+        ldr     x0, [x19, #CTX_N_HEADS]
+        lsr     x0, x0, #1              // head pairs
+        mul     x0, x0, x20
+        bl      tp_attn_batch
+        b       81f
+80:     // otherwise per token: point buf_q / buf_att_out at token t (no copies)
         ldr     x0, [x19, #CTX_BUF_Q]
         str     x0, [sp, #FB_SAVE_Q]
         ldr     x0, [x19, #CTX_BUF_ATT_OUT]
@@ -854,7 +882,7 @@ transformer_forward_batch:
         str     x0, [x19, #CTX_BUF_Q]
         ldr     x0, [sp, #FB_SAVE_ATT]
         str     x0, [x19, #CTX_BUF_ATT_OUT]
-        ldr     x0, [x19, #CTX_Q_DIM]   // output projection for the batch
+81:     ldr     x0, [x19, #CTX_Q_DIM]   // output projection for the batch
         lsl     x0, x0, #2
         ADR_L   x1, g_mm_xstride
         str     x0, [x1]
@@ -1039,6 +1067,223 @@ gqa_attn_head:
         add     x28, x28, #1
         b       4b
 5:      ldp     x27, x28, [sp, #80]
+        ldp     x25, x26, [sp, #64]
+        ldp     x23, x24, [sp, #48]
+        ldp     x21, x22, [sp, #32]
+        ldp     x19, x20, [sp, #16]
+        ldp     x29, x30, [sp], #96
+        ret
+
+// void attn_pair_item(uint64 item x0) — one chunk of the batched prefill
+// attention: query heads h and h + 1 of token b, h = 2 * (item / tp_ab_b),
+// b = tp_ab_b - 1 - item % tp_ab_b. Consecutive chunks share a kv head, so its
+// K/V rows stay in the core's L2 from token to token, and the longest rows of
+// each pair go first. Both heads read kv head h / gqa (gqa is even); head_dim
+// is 128. Scores use a 2 head x 2 position
+// register tile (each q and K load serves two products); values keep 2 heads x
+// 32 outputs in registers over all positions instead of a load and a store of
+// the output per position. Every float operation matches gqa_attn_head
+// (dot_f32, softmax, saxpy_f32) lane for lane: the output is bit-identical.
+attn_pair_item:
+        stp     x29, x30, [sp, #-96]!
+        stp     x19, x20, [sp, #16]
+        stp     x21, x22, [sp, #32]
+        stp     x23, x24, [sp, #48]
+        stp     x25, x26, [sp, #64]
+        stp     x27, x28, [sp, #80]
+        ADR_L   x19, g_ctx
+        ADR_L   x9, tp_ab_b
+        ldr     x4, [x9]
+        udiv    x2, x0, x4              // head pair
+        msub    x3, x2, x4, x0          // rank of the token
+        sub     x4, x4, #1
+        sub     x20, x4, x3             // token b
+        lsl     x21, x2, #1             // h
+        ADR_L   x9, tp_pos
+        ldr     x22, [x9]
+        add     x22, x22, x20
+        add     x22, x22, #1            // n = pos0 + b + 1 positions
+        ldr     x0, [x19, #CTX_Q_DIM]
+        ldr     x1, [x19, #CTX_KV_DIM]
+        add     x1, x0, x1, lsl #1      // floats per token in buf_bqkv
+        mul     x1, x1, x20
+        ldr     x2, [x19, #CTX_BUF_BQKV]
+        add     x1, x2, x1, lsl #2
+        add     x23, x1, x21, lsl #9    // q of head h (h + 1 at +512)
+        mul     x1, x0, x20
+        ldr     x2, [x19, #CTX_BUF_BATT]
+        add     x1, x2, x1, lsl #2
+        add     x28, x1, x21, lsl #9    // output of head h (h + 1 at +512)
+        ldr     x3, [x19, #CTX_MAX_SEQ]
+        lsl     x4, x3, #2              // score row bytes
+        ldr     x5, [x19, #CTX_N_HEADS]
+        madd    x5, x20, x5, x21        // b * n_heads + h
+        ldr     x6, [x19, #CTX_BUF_BSCR]
+        madd    x24, x5, x4, x6         // scores of head h
+        add     x25, x24, x4            // scores of head h + 1
+        ADR_L   x9, tp_gqa
+        ldr     w6, [x9]
+        udiv    x6, x21, x6             // kv head
+        mul     x6, x6, x3
+        lsl     x6, x6, #9              // kv_h * max_seq * 512
+        ADR_L   x9, tp_kv_base
+        ldr     x7, [x9]
+        add     x6, x6, x7
+        ldr     x7, [x19, #CTX_BUF_K_CACHE]
+        add     x26, x7, x6             // K rows of the kv head
+        ldr     x7, [x19, #CTX_BUF_V_CACHE]
+        add     x27, x7, x6             // V rows
+
+        // scores: positions t, t + 1 for both heads (odd tail: t twice)
+        mov     x20, #0
+1:      add     x10, x26, x20, lsl #9   // K row t
+        add     x11, x10, #512          // K row t + 1
+        add     x12, x20, #1
+        cmp     x12, x22
+        csel    x11, x11, x10, lo
+        mov     x13, x23
+        add     x14, x23, #512
+        movi    v16.4s, #0
+        movi    v17.4s, #0
+        movi    v18.4s, #0
+        movi    v19.4s, #0
+        movi    v20.4s, #0
+        movi    v21.4s, #0
+        movi    v22.4s, #0
+        movi    v23.4s, #0
+        movi    v24.4s, #0
+        movi    v25.4s, #0
+        movi    v26.4s, #0
+        movi    v27.4s, #0
+        movi    v28.4s, #0
+        movi    v29.4s, #0
+        movi    v30.4s, #0
+        movi    v31.4s, #0
+        mov     x15, #8                 // 16 floats per step, accumulators as in dot_f32
+2:      ldp     q0, q1, [x13], #32      // q h
+        ldp     q8, q9, [x10], #32      // K t
+        ldp     q12, q13, [x11], #32    // K t + 1
+        ldp     q4, q5, [x14], #32      // q h + 1
+        fmla    v16.4s, v0.4s, v8.4s    // (h, t): v16..v19
+        ldp     q2, q3, [x13], #32
+        fmla    v17.4s, v1.4s, v9.4s
+        ldp     q10, q11, [x10], #32
+        fmla    v20.4s, v0.4s, v12.4s   // (h, t + 1): v20..v23
+        ldp     q14, q15, [x11], #32
+        fmla    v21.4s, v1.4s, v13.4s
+        ldp     q6, q7, [x14], #32
+        fmla    v24.4s, v4.4s, v8.4s    // (h + 1, t): v24..v27
+        fmla    v25.4s, v5.4s, v9.4s
+        fmla    v28.4s, v4.4s, v12.4s   // (h + 1, t + 1): v28..v31
+        fmla    v29.4s, v5.4s, v13.4s
+        fmla    v18.4s, v2.4s, v10.4s
+        fmla    v19.4s, v3.4s, v11.4s
+        fmla    v22.4s, v2.4s, v14.4s
+        fmla    v23.4s, v3.4s, v15.4s
+        fmla    v26.4s, v6.4s, v10.4s
+        fmla    v27.4s, v7.4s, v11.4s
+        fmla    v30.4s, v6.4s, v14.4s
+        fmla    v31.4s, v7.4s, v15.4s
+        subs    x15, x15, #1
+        b.ne    2b
+        fadd    v16.4s, v16.4s, v17.4s  // reduction order of dot_f32
+        fadd    v18.4s, v18.4s, v19.4s
+        fadd    v16.4s, v16.4s, v18.4s
+        fadd    v20.4s, v20.4s, v21.4s
+        fadd    v22.4s, v22.4s, v23.4s
+        fadd    v20.4s, v20.4s, v22.4s
+        fadd    v24.4s, v24.4s, v25.4s
+        fadd    v26.4s, v26.4s, v27.4s
+        fadd    v24.4s, v24.4s, v26.4s
+        fadd    v28.4s, v28.4s, v29.4s
+        fadd    v30.4s, v30.4s, v31.4s
+        fadd    v28.4s, v28.4s, v30.4s
+        faddp   v16.4s, v16.4s, v20.4s
+        faddp   v24.4s, v24.4s, v28.4s
+        faddp   v16.4s, v16.4s, v24.4s  // (h, t) (h, t + 1) (h + 1, t) (h + 1, t + 1)
+        ADR_L   x9, tp_scale
+        ld1r    {v0.4s}, [x9]
+        fmul    v16.4s, v16.4s, v0.4s
+        add     x9, x24, x20, lsl #2
+        add     x10, x25, x20, lsl #2
+        cmp     x12, x22
+        b.hs    3f
+        str     d16, [x9]
+        st1     {v16.d}[1], [x10]
+        add     x20, x20, #2
+        cmp     x20, x22
+        b.lo    1b
+        b       4f
+3:      str     s16, [x9]               // last position of an odd count
+        st1     {v16.s}[2], [x10]
+4:      mov     x0, x24
+        mov     x1, x22
+        bl      softmax
+        mov     x0, x25
+        mov     x1, x22
+        bl      softmax
+
+        // outputs: 4 blocks of 32 floats per head, accumulated over all positions
+        mov     x20, #0
+5:      movi    v16.4s, #0
+        movi    v17.4s, #0
+        movi    v18.4s, #0
+        movi    v19.4s, #0
+        movi    v20.4s, #0
+        movi    v21.4s, #0
+        movi    v22.4s, #0
+        movi    v23.4s, #0
+        movi    v24.4s, #0
+        movi    v25.4s, #0
+        movi    v26.4s, #0
+        movi    v27.4s, #0
+        movi    v28.4s, #0
+        movi    v29.4s, #0
+        movi    v30.4s, #0
+        movi    v31.4s, #0
+        add     x10, x27, x20
+        mov     x11, x24
+        mov     x12, x25
+        mov     x13, x22
+6:      ldr     s8, [x11], #4           // weight of position t, head h
+        ldr     s9, [x12], #4           // head h + 1
+        ldp     q0, q1, [x10]
+        ldp     q2, q3, [x10, #32]
+        fmla    v16.4s, v0.4s, v8.s[0]
+        ldp     q4, q5, [x10, #64]
+        fmla    v24.4s, v0.4s, v9.s[0]
+        ldp     q6, q7, [x10, #96]
+        fmla    v17.4s, v1.4s, v8.s[0]
+        add     x10, x10, #512
+        fmla    v25.4s, v1.4s, v9.s[0]
+        fmla    v18.4s, v2.4s, v8.s[0]
+        fmla    v26.4s, v2.4s, v9.s[0]
+        fmla    v19.4s, v3.4s, v8.s[0]
+        fmla    v27.4s, v3.4s, v9.s[0]
+        fmla    v20.4s, v4.4s, v8.s[0]
+        fmla    v28.4s, v4.4s, v9.s[0]
+        fmla    v21.4s, v5.4s, v8.s[0]
+        fmla    v29.4s, v5.4s, v9.s[0]
+        fmla    v22.4s, v6.4s, v8.s[0]
+        fmla    v30.4s, v6.4s, v9.s[0]
+        fmla    v23.4s, v7.4s, v8.s[0]
+        fmla    v31.4s, v7.4s, v9.s[0]
+        subs    x13, x13, #1
+        b.ne    6b
+        add     x9, x28, x20
+        stp     q16, q17, [x9]
+        stp     q18, q19, [x9, #32]
+        stp     q20, q21, [x9, #64]
+        stp     q22, q23, [x9, #96]
+        add     x9, x9, #512
+        stp     q24, q25, [x9]
+        stp     q26, q27, [x9, #32]
+        stp     q28, q29, [x9, #64]
+        stp     q30, q31, [x9, #96]
+        add     x20, x20, #128
+        cmp     x20, #512
+        b.lo    5b
+        ldp     x27, x28, [sp, #80]
         ldp     x25, x26, [sp, #64]
         ldp     x23, x24, [sp, #48]
         ldp     x21, x22, [sp, #32]

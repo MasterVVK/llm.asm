@@ -2,7 +2,7 @@
 
 **English** · [Русский](README.ru.md) · [简体中文](README.zh-CN.md)
 
-A port of the [llm.asm](https://github.com/alesha-pro/llm.asm) Linux inference engine (Qwen3-0.6B Q8_0) to AArch64 assembly, written from scratch with GNU `as` and `ld`: no C, no libc, a 12 KB static ELF (`build/asm-llm-arm64`). It uses the same model file (`.asmbin` v2), chat template, tokenizer and output format as the x86-64 build.
+A port of the [llm.asm](https://github.com/alesha-pro/llm.asm) Linux inference engine (Qwen3-0.6B Q8_0) to AArch64 assembly, written from scratch with GNU `as` and `ld`: no C, no libc, a 17 KB static ELF (`build/asm-llm-arm64`). It uses the same model file (`.asmbin` v2), chat template, tokenizer and output format as the x86-64 build.
 
 ## What differs from the x86-64 code
 
@@ -43,7 +43,7 @@ Prefill with DDR fixed, tokens per second: this port 26.8 / 37.8 / 44.6 on 1 / 2
 - **Little cores.** llama.cpp is 1.3–1.6× faster on A55 with DDR fixed.
 - **DDR frequency.** With the default governor, work on A55 cores alone keeps the memory at 534 MHz, while any A76 at work raises it to 2400 MHz. A55-only workloads are therefore memory-starved by default: on one A55 this port gains 49% when DDR is fixed.
 - **Mixing.** Adding A55 cores to the four A76 slows both engines down, because memory bandwidth is already saturated. Use the 4 big cores: with all cores allowed, `-t 4` picks the A76 automatically.
-- **Prefill** is batched with a register-tiled kernel: llama.cpp is 1.07–1.44× faster (it was 2.3–5× with token-by-token prefill).
+- **Prefill** is batched, with a register-tiled matrix kernel and one attention job per layer: llama.cpp is 1.02–1.37× faster (it was 2.3–5× with token-by-token prefill).
 
 ## Ollama and two OSes at once
 
@@ -86,17 +86,19 @@ Same scheme as the x86-64 build, 16 tokens per pass by default. The pass kernel 
 
 Kernel alone, data in L1 (`aarch64/kbench.s`), cycles per row, token and 32-value block: A76 1.93 (was 2.35), A55 8.1 (was 11.0).
 
-Prefill, Qwen3-0.6B, tokens per second (3 runs, each started below 65 °C; llama.cpp as above, `llama-bench -p 34,227`; `results/prefill-tiles.txt`):
+Attention of a pass is one pool job per layer: a chunk is two query heads of one token, which read the same kv head. Scores are computed for 2 heads × 2 positions at once in 16 accumulators that keep the layout and reduction order of the single-token dot product, so every q and K load serves two products. Each 32-value output block of both heads stays in registers over all positions instead of a load and a store of the output per position. The chunks of one head pair follow each other, so its K and V rows stay in the 512 KB L2 of the core from token to token; in token-major order the same kernel gained nothing on one A76. The logits stay bit-identical.
+
+Prefill, Qwen3-0.6B, tokens per second (3 runs, each started below 65 °C; llama.cpp as above, `llama-bench -p 34,227`; `results/prefill-tiles.txt`, `results/prefill-attention.txt`):
 
 | Cores | 34 tokens: token by token | 34 tokens: batched | 34 tokens: llama.cpp | 227 tokens: batched | 227 tokens: llama.cpp |
 |---|---:|---:|---:|---:|---:|
-| 4×A76 | 45 | 172–188 | 213 | 177–181 | 206 |
-| 1×A76 | 27 | 55–57 | 60 | 49–50 | 57 |
-| 4×A55 | 13 | 37–39 | 53 | 36 | 52 |
+| 4×A76 | 45 | 173–177 | 213 | 193–203 | 206 |
+| 1×A76 | 27 | 53–57 | 60 | 53–54 | 57 |
+| 4×A55 | 13 | 37–40 | 53 | 39 | 52 |
 
-The first batched version (one 4-row group and one token at a time) reached 150 / 47 / 29.5 tok/s on the 34-token prompt and 157 / 43 / 27.8 on the 227-token one.
+Against the previous version in alternating runs, batched attention adds 8–11% on the 227-token prompt (4×A76: 179 → 202 tok/s); on the 34-token prompt the change is within run-to-run noise. The first batched version (one 4-row group and one token at a time) reached 150 / 47 / 29.5 tok/s on the 34-token prompt and 157 / 43 / 27.8 on the 227-token one.
 
-What is left: on 1×A76 with the 227-token prompt, attention takes 0.72 s of 4.6 s. It runs token by token, with a dot product and a horizontal sum for every cached position. Quantization, norms and SiLU take another 0.2 s.
+What is left, 227-token prompt: attention takes 0.44 s of 4.2 s on 1×A76 (0.83 s before): about 0.13 s for the scores, 0.06 s for softmax and 0.25 s for the weighted sum of V, half of which waits for V rows from L2. On 4×A76 it takes 0.15 s of 1.16 s. Activation quantization, norms and SiLU take about 0.2 s more and run on one thread.
 
 ## Build and run
 
