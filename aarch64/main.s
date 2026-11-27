@@ -19,6 +19,7 @@
         .equ O_T2,      96
         .equ O_T3,      104
         .equ O_NOREPACK, 112
+        .equ O_BATCH,   120
 
 
         .text
@@ -56,6 +57,8 @@ _start:
         mov     x0, #128
         str     x0, [x24, #O_MAX_TOK]
         str     xzr, [x24, #O_THREADS]  // 0 = auto (big cores of the taskset mask)
+        mov     x0, #DEFAULT_BATCH
+        str     x0, [x24, #O_BATCH]
         mov     x0, #2048
         str     x0, [x24, #O_CTX]
         mov     x0, #1
@@ -77,6 +80,7 @@ _start:
         FLAG    flg_nohp, .Lopt_nohp
         FLAG    flg_norepack, .Lopt_norepack
         FLAG    flg_chunk, .Lopt_chunk
+        FLAG    flg_batch, .Lopt_batch
         b       .Lusage
 .Lopt_m: NEXT_ARG x0
         str     x0, [x24, #O_MODEL]
@@ -116,6 +120,13 @@ _start:
         bl      parse_u64
         ADR_L   x1, tp_chunk_shift
         str     x0, [x1]
+        b       .Lnext
+.Lopt_batch: NEXT_ARG x0
+        bl      parse_u64
+        cmp     x0, #MAX_BATCH
+        mov     x1, #MAX_BATCH
+        csel    x0, x0, x1, ls
+        str     x0, [x24, #O_BATCH]
         b       .Lnext
 .Lopt_nohp:
         str     xzr, [x24, #O_HP]
@@ -189,6 +200,28 @@ _start:
         bl      sys_clock_ns
         str     x0, [x24, #O_T0]
         mov     x26, #0
+        ldr     x0, [x24, #O_BATCH]     // batched when the weights are repacked
+        cmp     x0, #1
+        b.ls    4f
+        ADR_L   x0, g_mm_delta
+        ldr     x0, [x0]
+        cbz     x0, 4f
+40:     cmp     x26, x23
+        b.hs    5f
+        sub     x1, x23, x26
+        ldr     x0, [x24, #O_BATCH]
+        cmp     x1, x0
+        csel    x1, x1, x0, ls          // tokens in this pass
+        mov     x27, x1
+        ldr     x0, [x25, #CTX_BUF_PROMPT]
+        add     x0, x0, x26, lsl #2
+        mov     x2, x26                 // pos0
+        add     x3, x26, x1
+        cmp     x3, x23
+        cset    x3, eq                  // logits only after the last pass
+        bl      transformer_forward_batch
+        add     x26, x26, x27
+        b       40b
 4:      cmp     x26, x23
         b.hs    5f
         ldr     x0, [x25, #CTX_BUF_PROMPT]
@@ -390,6 +423,7 @@ flg_hp: .asciz "--hugepages"
 flg_norepack: .asciz "--norepack"
 flg_nohp: .asciz "--nohugepages"
 flg_chunk: .asciz "--chunk-shift"
+flg_batch: .asciz "--batch"
 msg_little: .asciz ", a55="
 msg_load: .asciz "[asm-llm] load   : "
 msg_ms_nl: .asciz " ms\n"
@@ -420,7 +454,8 @@ msg_usage:
         .ascii "  --nohugepages        Do not request 2 MiB pages (default: on)\n"
         .ascii "  --hugepages          (default) 2 MiB pages; with --norepack copies the file\n"
         .ascii "  --norepack           Row-major kernel instead of 4-row interleaved\n"
-        .asciz "  --chunk-shift <n>    Rows per work chunk = 2^n (default 4; 8 on A55-only sets)\n"
+        .ascii "  --chunk-shift <n>    Rows per work chunk = 2^n (default 4; 8 on A55-only sets)\n"
+        .asciz "  --batch <n>          Prompt tokens per weight pass (default 16, 1 = per token)\n"
 
         .bss
         .balign 8

@@ -35,6 +35,16 @@ Hardware: a Proxmox VE 8.4 host with 2× Xeon E5-2696 v2 (Ivy Bridge-EP, 12 core
 
 Bare-metal OS in a diskless Proxmox VM on the same host (`results/proxmox-os-vm250.txt`): the kernel boots in 170–180 ms and the prompt appears 8 s after the VM starts. On the same prompt it decodes faster than the Linux build by 24% with 1 core, 12% with 4, 4% with 8 and 5% with 12 cores, reaching 55.4 tok/s at 12 cores.
 
+## Batched prefill
+
+The prompt is processed in passes of up to 16 tokens (default 8; `--batch n`, `--batch 1` = one token at a time). Each weight row is read from memory once per pass and multiplied with every token of the pass by the same instruction sequence as the single-token kernel, so the KV cache and the logits are bit-identical to token-by-token prefill. Prefill of the 34-token prompt, Qwen3-0.6B, tokens per second:
+
+| Threads | Token by token | Batched | llama.cpp |
+|---:|---:|---:|---:|
+| 4 | 38 | 65 | 72 |
+| 8 | 55 | 106 | 145 |
+| 16 | 43 | 115 | 210 |
+
 ## Larger Qwen3 models
 
 The same engine runs Qwen3-1.7B and Qwen3-4B; `scripts/export_weights.py` now reads sharded checkpoints. Decode in tokens per second on the same host, median of 3 runs, llama.cpp b12810 with the official Q8_0 GGUF:
@@ -53,7 +63,7 @@ Prefill stays 1.4–3.4× slower than llama.cpp. `--hugepages` copies the weight
 
 ## Limitations
 
-- Prefill runs token by token, so it is 1.5–4× slower than llama.cpp. With long prompts llama.cpp wins on total time.
+- Prefill is batched (see above) but still 1.1–1.8× slower than llama.cpp at 4–16 threads.
 - Qwen3-0.6B only: the architecture is hard-coded, the context is limited to 2048 tokens, and there is no GPU support or network API.
 - **The bare-metal OS keeps all of its vCPUs at 100% even when idle**: worker cores wait in a `pause` loop and there is no `hlt`. On a shared hypervisor, run it only while you use it.
 - Under Linux, do not set `-t` above the number of free cores. The default is 32 threads, and on a busy machine throughput drops by more than an order of magnitude (upstream issues #9 and #10).

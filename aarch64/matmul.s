@@ -17,12 +17,16 @@
         .global quantize_x_q8_0, matmul_q8_0_range, dequant_row_q8_0
         .global dot_f32, saxpy_f32, q8_xq, q8_xs
         .global repack_q8_0_4x4, matmul_q8_0_4x4_pf, matmul_q8_0_4x4_nopf
+        .global quantize_x_batch, matmul_q8_0_4x4b_pf, matmul_q8_0_4x4b_nopf
+        .global g_mm_b, g_mm_m4, g_mm_xstride
 
 // void quantize_x_q8_0(const float *x x0, uint64 K x1)
 // q8_xs[b] = max|x| / 127, q8_xq = round-half-even(x * 127 / max|x|) in [-127, 127]
 quantize_x_q8_0:
         ADR_L   x2, q8_xq
         ADR_L   x3, q8_xs
+// quantize_core: x0 = x, x1 = K, x2 = xq, x3 = xs. Clobbers x0-x4, SIMD.
+quantize_core:
         ADR_L   x4, q8_consts
         ldp     s29, s30, [x4]          // 1/127, 127.0
         movi    v28.16b, #0x81          // -127 as int8
@@ -324,6 +328,139 @@ repack_q8_0_4x4:
         MM4X4 matmul_q8_0_4x4_pf, 1
         MM4X4 matmul_q8_0_4x4_nopf, 0
 
+
+// Batched prefill twin of MM4X4: g_mm_b tokens, out[t] at out + t * g_mm_m4.
+// For every 4-row group the per-token loop below is the GEMV block loop
+// verbatim, so results are bit-identical to token-by-token prefill; the group
+// is read from DRAM once and from L1 for the other tokens.
+        .macro MM4X4B name, pf
+\name:
+        stp     x29, x30, [sp, #-48]!
+        stp     x19, x20, [sp, #16]
+        stp     x21, x22, [sp, #32]
+        cmp     x4, x3
+        b.ls    9f
+        add     x5, x2, x2, lsr #4      // row_stride
+        lsl     x6, x5, #2              // group stride
+        lsr     x7, x3, #2
+        madd    x10, x7, x6, x0         // first group
+        add     x1, x1, x3, lsl #2      // out of token 0, first row
+        sub     x4, x4, x3
+        lsr     x4, x4, #2              // groups
+        lsr     x9, x2, #6              // block pairs (K % 64 == 0)
+        ADR_L   x19, g_mm_b
+        ldr     x19, [x19]
+        ADR_L   x20, g_mm_m4
+        ldr     x20, [x20]
+        mov     x7, #XQ_STRIDE
+1:      ADR_L   x14, q8b_xq
+        ADR_L   x15, q8b_xs
+        mov     x21, x1
+        mov     x22, x19
+2:      mov     x11, x10                // weights
+        add     x12, x10, x2, lsl #2    // fp16 scales
+        mov     x13, x14
+        mov     x16, x15
+        movi    v24.4s, #0
+        movi    v25.4s, #0
+        mov     x17, x9
+3:      ld1     {v0.16b, v1.16b, v2.16b, v3.16b}, [x11], #64   // block b, k-groups 0..3
+        ldp     q16, q17, [x13], #32    // x block b
+        movi    v28.4s, #0
+        movi    v29.4s, #0
+        sdot    v28.4s, v0.16b, v16.4b[0]
+        sdot    v29.4s, v1.16b, v16.4b[1]
+        ld1     {v4.16b, v5.16b, v6.16b, v7.16b}, [x11], #64   // k-groups 4..7
+        sdot    v28.4s, v2.16b, v16.4b[2]
+        sdot    v29.4s, v3.16b, v16.4b[3]
+        ldp     q18, q19, [x13], #32    // x block b+1
+        sdot    v28.4s, v4.16b, v17.4b[0]
+        sdot    v29.4s, v5.16b, v17.4b[1]
+        ld1     {v0.16b, v1.16b, v2.16b, v3.16b}, [x11], #64   // block b+1
+        movi    v30.4s, #0
+        movi    v31.4s, #0
+        sdot    v28.4s, v6.16b, v17.4b[2]
+        sdot    v29.4s, v7.16b, v17.4b[3]
+        sdot    v30.4s, v0.16b, v18.4b[0]
+        sdot    v31.4s, v1.16b, v18.4b[1]
+        ld1     {v4.16b, v5.16b, v6.16b, v7.16b}, [x11], #64
+        ldr     q26, [x12], #16         // fp16 scales: 4 rows x 2 blocks
+        sdot    v30.4s, v2.16b, v18.4b[2]
+        sdot    v31.4s, v3.16b, v18.4b[3]
+        ldr     d27, [x16], #8          // x scales of both blocks
+        sdot    v30.4s, v4.16b, v19.4b[0]
+        sdot    v31.4s, v5.16b, v19.4b[1]
+        fcvtl   v20.4s, v26.4h
+        fcvtl2  v21.4s, v26.8h
+        sdot    v30.4s, v6.16b, v19.4b[2]
+        sdot    v31.4s, v7.16b, v19.4b[3]
+        add     v28.4s, v28.4s, v29.4s
+        fmul    v20.4s, v20.4s, v27.s[0]
+        fmul    v21.4s, v21.4s, v27.s[1]
+        add     v30.4s, v30.4s, v31.4s
+        scvtf   v28.4s, v28.4s
+        scvtf   v30.4s, v30.4s
+        .if \pf
+        prfm    pldl1keep, [x11, #PF_DIST]       // one prefetch per 64-byte line
+        prfm    pldl1keep, [x11, #(PF_DIST + 64)]
+        prfm    pldl1keep, [x11, #(PF_DIST + 128)]
+        prfm    pldl1keep, [x11, #(PF_DIST + 192)]
+        .endif
+        fmla    v24.4s, v28.4s, v20.4s
+        fmla    v25.4s, v30.4s, v21.4s
+        subs    x17, x17, #1
+        b.ne    3b
+        fadd    v24.4s, v24.4s, v25.4s
+        str     q24, [x21]              // rows 4g .. 4g+3 of token t
+        add     x21, x21, x20
+        add     x14, x14, x7
+        add     x15, x15, #XS_STRIDE
+        subs    x22, x22, #1
+        b.ne    2b
+        add     x1, x1, #16
+        add     x10, x10, x6
+        subs    x4, x4, #1
+        b.ne    1b
+9:      ldp     x21, x22, [sp, #32]
+        ldp     x19, x20, [sp, #16]
+        ldp     x29, x30, [sp], #48
+        ret
+        .endm
+
+        MM4X4B matmul_q8_0_4x4b_pf, 1
+        MM4X4B matmul_q8_0_4x4b_nopf, 0
+
+// void quantize_x_batch(const float *X x0, uint64 K x1, uint64 B x2, uint64 stride x3)
+quantize_x_batch:
+        stp     x29, x30, [sp, #-64]!
+        stp     x19, x20, [sp, #16]
+        stp     x21, x22, [sp, #32]
+        str     x23, [sp, #48]
+        mov     x19, x0
+        mov     x20, x1
+        mov     x21, x2
+        mov     x22, x3
+        mov     x23, #0
+1:      cmp     x23, x21
+        b.hs    2f
+        mov     x0, x19
+        mov     x1, x20
+        mov     x4, #XQ_STRIDE
+        ADR_L   x2, q8b_xq
+        madd    x2, x23, x4, x2
+        mov     x4, #XS_STRIDE
+        ADR_L   x3, q8b_xs
+        madd    x3, x23, x4, x3
+        bl      quantize_core
+        add     x19, x19, x22
+        add     x23, x23, #1
+        b       1b
+2:      ldr     x23, [sp, #48]
+        ldp     x21, x22, [sp, #32]
+        ldp     x19, x20, [sp, #16]
+        ldp     x29, x30, [sp], #64
+        ret
+
 // void dequant_row_q8_0(const void *row x0, float *out x1, uint64 K x2)
 dequant_row_q8_0:
         add     x3, x0, x2              // fp16 scales
@@ -405,3 +542,11 @@ q8_consts:
 q8_xq:  .skip   Q8_MAX_K
         .balign 64
 q8_xs:  .skip   (Q8_MAX_K / 32) * 4
+        .balign 64
+q8b_xq: .skip   MAX_BATCH * XQ_STRIDE
+        .balign 64
+q8b_xs: .skip   MAX_BATCH * XS_STRIDE
+        .balign 8
+g_mm_b: .skip   8
+g_mm_m4: .skip  8
+g_mm_xstride: .skip 8

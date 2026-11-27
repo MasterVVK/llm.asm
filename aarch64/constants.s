@@ -88,6 +88,12 @@
         .equ MAX_PROMPT_TOKENS, 8192
         .equ MAX_GEN_TOKENS,    8192
         .equ Q8_MAX_K,          16384
+        .equ MAX_BATCH,         16              // prompt tokens per weight pass
+        .ifndef DEFAULT_BATCH
+        .equ DEFAULT_BATCH,     16              // best on A76 (64 KB L1D) and A55 alike
+        .endif
+        .equ XQ_STRIDE,         (Q8_MAX_K + 64) // per-token int8 slot (+64: no L1 aliasing)
+        .equ XS_STRIDE,         ((Q8_MAX_K / 32) * 4 + 64)
         .ifndef CH_SHIFT
         .equ CH_SHIFT,          4               // 16 rows per dynamically claimed chunk
         .endif
@@ -140,8 +146,15 @@
         .equ CTX_BUF_V_CACHE,   320
         .equ CTX_BUF_PROMPT,    328
         .equ CTX_BUF_GEN,       336
-        .equ CTX_N_BUFS,        17
-        .equ CTX_SIZE,          384
+        .equ CTX_BUF_BX,        344             // batched prefill: [MAX_BATCH][dim]
+        .equ CTX_BUF_BXB,       352             // [MAX_BATCH][dim]
+        .equ CTX_BUF_BQKV,      360             // [MAX_BATCH][q_dim + 2 kv_dim]
+        .equ CTX_BUF_BATT,      368             // [MAX_BATCH][q_dim]
+        .equ CTX_BUF_BGU,       376             // [MAX_BATCH][2 hidden_dim]
+        .equ CTX_BUF_BCOS,      384             // [MAX_BATCH][head_dim / 2]
+        .equ CTX_BUF_BSIN,      392
+        .equ CTX_N_BUFS,        24
+        .equ CTX_SIZE,          448
 
 // adrp + add for a symbol in a static executable
         .macro ADR_L reg, sym

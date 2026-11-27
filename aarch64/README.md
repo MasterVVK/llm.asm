@@ -43,7 +43,7 @@ Prefill with DDR fixed, tokens per second: this port 26.8 / 37.8 / 44.6 on 1 / 2
 - **Little cores.** llama.cpp is 1.3–1.6× faster on A55 with DDR fixed.
 - **DDR frequency.** With the default governor, work on A55 cores alone keeps the memory at 534 MHz, while any A76 at work raises it to 2400 MHz. A55-only workloads are therefore memory-starved by default: on one A55 this port gains 49% when DDR is fixed.
 - **Mixing.** Adding A55 cores to the four A76 slows both engines down, because memory bandwidth is already saturated. Use the 4 big cores: with all cores allowed, `-t 4` picks the A76 automatically.
-- **Prefill** is 2.3–5× slower than llama.cpp, because this engine processes the prompt token by token.
+- **Prefill** is batched now: 1.2–1.8× slower than llama.cpp (it was 2.3–5×).
 
 ## Ollama and two OSes at once
 
@@ -79,6 +79,16 @@ Qwen3-1.7B Q8_0, decode in tokens per second, same method as above:
 | 1×A76 | 7.1 | 8.4 | 8.6 |
 | 4×A76 | **11.7** | 10.8 | 11.1 |
 | 4×A55 | 5.3 | 6.4 | 6.0 |
+
+## Batched prefill
+
+Same scheme as the x86-64 build, 16 tokens per pass by default; logits are bit-identical to token-by-token prefill on every core set. Prefill of the 34-token prompt, Qwen3-0.6B, tokens per second:
+
+| Cores | Token by token | Batched | llama.cpp |
+|---|---:|---:|---:|
+| 4×A76 | 45 | 161 | 211–216 |
+| 1×A76 | 27 | 48 | 55–64 |
+| 4×A55 | 13 | 29 | 52 |
 
 ## Build and run
 
