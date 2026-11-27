@@ -4,7 +4,7 @@
 
 A port of [alesha-pro/llm.asm](https://github.com/alesha-pro/llm.asm) (upstream commit `48feccb`) to x86-64 CPUs without AVX2 and FMA. It needs only AVX and F16C, so it runs on Intel Ivy Bridge (2012) and newer, including the Xeon E5 v2 servers that are still common in homelabs and Proxmox clusters. Upstream requires AVX2 + FMA (Haswell or newer) and on these machines stops with `Illegal instruction` (Linux) or `[FATAL] CPU lacks AVX2+FMA` (bare-metal OS).
 
-Both upstream programs are ported: the Linux inference engine (`build/asm-llm`, 20,968 bytes) and the bootable bare-metal OS (`build/asm-llm-os.elf`, 25,144 bytes).
+Both upstream programs are ported: the Linux inference engine (`build/asm-llm`, 21,128 bytes) and the bootable bare-metal OS (`build/asm-llm-os.elf`, 25,144 bytes).
 
 ## What changed
 
@@ -45,20 +45,20 @@ Kernel alone, data in L1 (`ivybridge/kbench.asm`): 6.0–6.4 cycles per row, tok
 
 Attention of a pass is one pool job per layer instead of one per token: a chunk is two query heads of one token, which read the same kv head, so every K and V load serves both heads. The scores keep the four accumulators and the reduction order of the single-token dot product; each 32-value output block of both heads stays in registers over all positions instead of a load and a store of the output per position. The chunks of one head pair follow each other, so its K and V rows stay in the core's L2 from token to token. The logits stay bit-identical.
 
-Between the matrix passes, residual adds, RMSNorm, activation quantization, QK-norm, RoPE, the KV copy and SwiGLU run as pool jobs too, with one token per chunk (SwiGLU: a quarter of a token), and the attention job quantizes its own outputs for the output projection. Each chunk runs the single-token code, so the logits stay bit-identical.
+Between the matrix passes, residual adds, RMSNorm and activation quantization run as pool jobs with one token per chunk, and the attention job quantizes its own outputs. QK-norm, RoPE, the KV copy and SwiGLU run inside the matrix passes, on rows the core has just computed: a Q/K/V chunk is half a head, and the chunk that completes the second half of a head runs these steps for that head; a gate/up chunk is 32 gate rows with the same 32 up rows, followed by SwiGLU and the Q8_0 block of those 32 values, which goes to a second activation buffer while the other chunks still read the first. Every step runs the single-token code, so the logits stay bit-identical. Adding the residual inside the projection chunks was slower and is not used (`results/prefill-fused.txt`).
 
-Prefill, Qwen3-0.6B, tokens per second (3 runs at 1 thread, 8 at 4–16 threads; llama.cpp b12810, `llama-bench -p 34,227`, mean ± sd of 3 repetitions; `results/prefill-tiles.txt`, `results/prefill-attention.txt`, `results/prefill-steps.txt`):
+Prefill, Qwen3-0.6B, tokens per second (5 runs; llama.cpp b12810, `llama-bench -p 34,227`, mean ± sd of 3 repetitions; `results/prefill-tiles.txt`, `results/prefill-attention.txt`, `results/prefill-steps.txt`, `results/prefill-fused.txt`):
 
 | Threads | 34 tokens: this port | 34 tokens: llama.cpp | 227 tokens: this port | 227 tokens: llama.cpp |
 |---:|---:|---:|---:|---:|
-| 1 | 26.5–27.5 | 21.6 | 28.5–29.4 | 21.0 |
-| 4 | 90–97 | 75 | 96–102 | 75.5 |
-| 8 | 146–174 | 124 ± 19 | 176–186 | 145 |
-| 16 | 182–222 | 248 ± 19 | 273–304 | 240 |
+| 1 | 26.5–27.5 | 21.6 | 28.2–29.7 | 21.0 |
+| 4 | 97–101 | 75 | 99–104 | 75.5 |
+| 8 | 177–185 | 124 ± 19 | 188–195 | 145 |
+| 16 | 230–252 | 248 ± 19 | 302–318 | 240 |
 
-Against the previous version in alternating runs (medians of 8), the per-token steps in the pool add 5–16% at 8–16 threads (227 tokens: 171 → 180 tok/s at 8 threads, 253 → 294 at 16; 34 tokens: 152 → 163 and 184 → 200) and 1–3% at 4 threads; one thread is unchanged. Batched attention before them added 3–8% on the 227-token prompt (245 → 262 tok/s at 16 threads). The first batched version (one row and one token at a time, fixed slices, 8 tokens per pass) reached 20 / 70 / 125–130 / 141–183 tok/s on the 227-token prompt at 1 / 4 / 8 / 16 threads.
+Against the previous version in alternating runs (medians of 5), running these steps inside the matrix passes adds 5–22% on the 34-token prompt at 4–16 threads (16 threads: 205 → 249 tok/s) and 0.5–5% on the 227-token one (301 → 316 at 16 threads); one thread and Qwen3-1.7B / 4B stay within ±1.3%. The per-token steps in the pool added 5–16% at 8–16 threads before that, and batched attention 3–8% on the 227-token prompt. The first batched version (one row and one token at a time, fixed slices, 8 tokens per pass) reached 20 / 70 / 125–130 / 141–183 tok/s on the 227-token prompt at 1 / 4 / 8 / 16 threads.
 
-On the short prompt at 16 threads llama.cpp stays ahead (248 vs 200 tok/s). Passes of 12 + 12 + 10 tokens instead of 16 + 16 + 2 (`--batch 12`) do not change that.
+On the short prompt at 16 threads the port is now level with llama.cpp (249 vs 248 ± 19 tok/s).
 
 ## Larger Qwen3 models
 
@@ -74,22 +74,22 @@ The same engine runs Qwen3-1.7B and Qwen3-4B; `scripts/export_weights.py` now re
 | 4B | 8 | 8.4 | 7.3 | +16% |
 | 4B | 16 | 8.8 | 7.8 | +13% |
 
-Prefill of the 227-token prompt in batched passes, tokens per second (median of 3; llama.cpp `llama-bench -p 227`, mean of 3; `results/prefill-tiles.txt`, `results/prefill-attention.txt`, `results/prefill-steps.txt`):
+Prefill of the 227-token prompt in batched passes, tokens per second (median of 3; llama.cpp `llama-bench -p 227`, mean of 3; `results/prefill-tiles.txt`, `results/prefill-attention.txt`, `results/prefill-steps.txt`, `results/prefill-fused.txt`):
 
 | Model | Threads | This port | llama.cpp | Gain |
 |---|---:|---:|---:|---:|
-| 1.7B | 4 | 35.9 | 26.0 | +38% |
-| 1.7B | 8 | 69.9 | 48.8 | +43% |
-| 1.7B | 16 | 120.4 | 71.5 | +68% |
-| 4B | 4 | 14.2 | 10.2 | +39% |
-| 4B | 8 | 26.9 | 19.7 | +37% |
-| 4B | 16 | 50.3 | 33.1 | +52% |
+| 1.7B | 4 | 36.3 | 26.0 | +40% |
+| 1.7B | 8 | 69.8 | 48.8 | +43% |
+| 1.7B | 16 | 124.1 | 71.5 | +74% |
+| 4B | 4 | 14.1 | 10.2 | +38% |
+| 4B | 8 | 28.0 | 19.7 | +42% |
+| 4B | 16 | 50.9 | 33.1 | +54% |
 
 `--hugepages` copies the weights into 2 MiB transparent huge pages: +8% at 4 threads for 1.7B and 4B, no gain at 8–16 threads, so it is off by default.
 
 ## Limitations
 
-- Prefill (see above) is faster than llama.cpp at 1–16 threads on a 227-token prompt (+22% at 16 threads); on the 34-token prompt llama.cpp is about 1.2× faster at 16 threads.
+- Prefill (see above) is faster than llama.cpp at 1–16 threads on a 227-token prompt (+32% at 16 threads) and level with it on the 34-token prompt at 16 threads.
 - Dense Qwen3 models only (0.6B, 1.7B and 4B tested): the architecture is hard-coded, the context is limited to 2048 tokens, and there is no GPU support or network API.
 - **The bare-metal OS keeps all of its vCPUs at 100% even when idle**: worker cores wait in a `pause` loop and there is no `hlt`. On a shared hypervisor, run it only while you use it.
 - Under Linux, do not set `-t` above the number of free cores. The default is 32 threads, and on a busy machine throughput drops by more than an order of magnitude (upstream issues #9 and #10).

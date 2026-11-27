@@ -46,6 +46,11 @@ default rel
 %define Q8_MAX_K 16384
 %define XQ_STRIDE (Q8_MAX_K + 64)            ; per-token slot, +64 avoids L1 set aliasing
 %define XS_STRIDE ((Q8_MAX_K / 32) * 4 + 64)
+; A slot set holds MAX_BATCH quantized activation vectors: int8 slots at +0,
+; fp32 block scales at +Q8B_XS. There are two sets (q8b_x, q8b_x2), so a pool
+; job can read one while it writes the other.
+%define Q8B_XS (MAX_BATCH * XQ_STRIDE)
+%define Q8B_SET (Q8B_XS + MAX_BATCH * XS_STRIDE)
 
 section .text
 
@@ -56,9 +61,10 @@ global quantize_x_q8_0
 global quantize_x_batch
 global quantize_x_slot
 global matmul_q8_0_batch_range
+global q8b_x
+global q8b_x2
 global g_mm_b
 global g_mm_m4
-global g_mm_xstride
 %endif
 %endif
 global dequant_row_q8_0
@@ -439,8 +445,8 @@ align 16
 %ifndef BARE_METAL
 ; ----------------------------------------------------------------------------
 ; void quantize_x_batch(const float *X, uint64 K, uint64 B, uint64 x_stride_bytes)
-; Quantizes B activation vectors into per-token slots q8b_xq / q8b_xs
-; with exactly the same code as quantize_x_q8_0.
+; Quantizes B activation vectors into the per-token slots of set q8b_x with
+; exactly the same code as quantize_x_q8_0.
 ; ----------------------------------------------------------------------------
 quantize_x_batch:
     push    rbx
@@ -459,11 +465,11 @@ quantize_x_batch:
     mov     rdi, r12
     mov     rsi, r13
     imul    rax, rbx, XQ_STRIDE
-    lea     r9, [rel q8b_xq]
+    lea     r9, [rel q8b_x]
     add     r9, rax
     xor     r11d, r11d                  ; no |x| slot: the tiled kernel does not read it
     imul    rax, rbx, XS_STRIDE
-    lea     r10, [rel q8b_xs]
+    lea     r10, [rel q8b_x + Q8B_XS]
     add     r10, rax
     call    quantize_core
     add     r12, r15
@@ -478,20 +484,18 @@ quantize_x_batch:
     ret
 
 ; ----------------------------------------------------------------------------
-; void quantize_x_slot(const float *x, uint64 n, uint64 t, uint64 k0)
-; Quantizes x[0..n) into elements k0 .. k0 + n - 1 of the q8b slot of token t
-; (k0 and n multiples of 32). Blocks are independent, so a token quantized in
-; parts gets the same bytes as quantize_x_batch. Clobbers rax, rcx, rdx,
-; r8-r11 and SIMD registers.
+; void quantize_x_slot(const float *x, uint64 n, uint64 t, uint64 k0, void *set)
+; Quantizes x[0..n) into elements k0 .. k0 + n - 1 of the slot of token t in
+; slot set q8b_x or q8b_x2 (k0 and n multiples of 32). Blocks are independent,
+; so a token quantized in parts gets the same bytes as quantize_x_batch.
+; Clobbers rax, rcx, rdx, r8-r11 and SIMD registers.
 ; ----------------------------------------------------------------------------
 quantize_x_slot:
     imul    rax, rdx, XQ_STRIDE
-    lea     r9, [rel q8b_xq]
-    add     r9, rax
+    lea     r9, [r8 + rax]
     add     r9, rcx                     ; int8 of element k0
     imul    rax, rdx, XS_STRIDE
-    lea     r10, [rel q8b_xs]
-    add     r10, rax
+    lea     r10, [r8 + rax + Q8B_XS]
     shr     rcx, 3                      ; scale of block k0 / 32
     add     r10, rcx
     xor     r11d, r11d                  ; no |x| slot
@@ -505,7 +509,7 @@ quantize_x_slot:
 ; [-127, 127], so neither form saturates). The float part runs on ymm with
 ; token A in the low and token B in the high 128 bits: one IEEE operation per
 ; lane, in the GEMV order, so every output is bit-identical to
-; matmul_q8_0_range. Only q8b_xq / q8b_xs are read (|x| is not needed).
+; matmul_q8_0_range. Only the slots are read (|x| is not needed).
 ;   ymm0..3  per-block accumulators [A | B]     ymm12  combined scales [A | B]
 ;   xmm13/14 |w| halves   xmm15 int16 ones      xmm4..8 temporaries
 ; ----------------------------------------------------------------------------
@@ -537,9 +541,10 @@ quantize_x_slot:
     vaddps     %2, %2, ymm4
 %endmacro
 
-; void matmul_q8_0_batch_range(const void *W, unused, float *out, uint64 K,
-;                              uint64 r0, uint64 r1)
-; out[t * M + r] for t < g_mm_b, token stride M * 4 in g_mm_m4.
+; void matmul_q8_0_batch_range(const void *W, const void *set, float *out,
+;                              uint64 K, uint64 r0, uint64 r1)
+; out[t * M + r] for t < g_mm_b, token stride M * 4 in g_mm_m4; activations
+; from slot set q8b_x or q8b_x2.
 matmul_q8_0_batch_range:
     push    rbx
     push    rbp
@@ -548,7 +553,7 @@ matmul_q8_0_batch_range:
     push    r14
     push    r15
     sub     rsp, 40                     ; [rsp] out row, [+8] row base, [+16] xq A, [+24] xs A
-
+    mov     [rsp + 32], rsi             ; [+32] slot set
     mov     rsi, r9
     sub     rsi, r8                     ; rows
     jle     .p_exit
@@ -569,8 +574,8 @@ matmul_q8_0_batch_range:
 
 .p_row:
     mov     rdx, [rsp]
-    lea     r11, [rel q8b_xq]
-    lea     rbp, [rel q8b_xs]
+    mov     r11, [rsp + 32]             ; int8 slot of token 0
+    lea     rbp, [r11 + Q8B_XS]         ; its scales
     mov     rdi, [rel g_mm_b]
 .p_pair:
     mov     r12d, XQ_STRIDE
@@ -755,11 +760,9 @@ alignb 64
 q8_xs:        resb (Q8_MAX_K / 32) * 4
 %ifndef BARE_METAL
 alignb 64
-q8b_xq:       resb MAX_BATCH * XQ_STRIDE
-alignb 64
-q8b_xs:       resb MAX_BATCH * XS_STRIDE
+q8b_x:        resb Q8B_SET              ; slot sets of the batched prefill
+q8b_x2:       resb Q8B_SET
 g_mm_b:       resq 1
 g_mm_m4:      resq 1
-g_mm_xstride: resq 1
 %endif
 %endif

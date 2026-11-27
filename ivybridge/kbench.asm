@@ -12,6 +12,7 @@ default rel
 
 extern quantize_x_batch
 extern matmul_q8_0_batch_range
+extern q8b_x
 extern quantize_x_q8_0
 extern matmul_q8_0_range
 extern matmul_set_fp16
@@ -154,7 +155,7 @@ _start:
     mov     r12, rax
 .bl_go:
     lea     rdi, [rel W]
-    xor     esi, esi
+    lea     rsi, [rel q8b_x]
     lea     rdx, [rel OUT]
     mov     rcx, [rel prm]
     xor     r8d, r8d
@@ -177,7 +178,7 @@ _start:
     mov     r12, rax
 .nl_go:
     lea     rdi, [rel W]
-    xor     esi, esi
+    lea     rsi, [rel q8b_x]
     lea     rdx, [rel OUT3]
     mov     rcx, [rel prm]
     xor     r8d, r8d

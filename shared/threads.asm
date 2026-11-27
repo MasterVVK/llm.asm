@@ -28,11 +28,6 @@ extern sys_mmap_anon
 extern matmul_q8_0_range
 %if FAST_Q8
 extern quantize_x_q8_0
-extern quantize_x_batch
-extern matmul_q8_0_batch_range
-extern g_mm_b
-extern g_mm_m4
-extern g_mm_xstride
 extern gqa_attn_range
 %endif
 
@@ -43,7 +38,6 @@ global tp_shutdown
 global tp_matmul_q8_0
 %if FAST_Q8
 global tp_gqa_attn
-global tp_matmul_batch
 global tp_for
 %endif
 
@@ -228,17 +222,8 @@ tp_init:
 %endif
     mov     r8,  r14                    ; r0
     mov     r9,  r15                    ; r1
-%if FAST_Q8
-    cmp     dword [rel tp_mode], 0
-    jne     .run_batch
-%endif
     call    matmul_q8_0_range
     jmp     .job_done
-%if FAST_Q8
-.run_batch:
-    call    matmul_q8_0_batch_range
-    jmp     .job_done
-%endif
 %if FAST_Q8
 .run_attn:
     mov     rcx, r14                    ; h0
@@ -264,8 +249,8 @@ tp_init:
 %if FAST_Q8
 ; ----------------------------------------------------------------------------
 ; tp_run_chunks: claim chunks of the published job with LOCK XADD until none
-; remain. Matmul jobs: 2^tp_chunk_shift rows per chunk; attention: one head
-; (tp_mode 2: chunk i runs tp_fn(i), see tp_for).
+; remain. GEMV jobs: 2^tp_chunk_shift rows per chunk; attention: one head;
+; item jobs (tp_mode 1, see tp_for): chunk i runs tp_fn(i).
 ; ----------------------------------------------------------------------------
 tp_run_chunks:
     push    rbx
@@ -289,19 +274,14 @@ tp_run_chunks:
     mov     rsi, [rel tp_x]
     mov     rdx, [rel tp_out]
     mov     rcx, [rel tp_K]
-    cmp     dword [rel tp_mode], 0
-    jne     .rc_batch
     call    matmul_q8_0_range
-    jmp     .rc_lp
-.rc_batch:
-    call    matmul_q8_0_batch_range
     jmp     .rc_lp
 .rc_attn:
     mov     rcx, rax                    ; h0
     cmp     rcx, [rel tp_M]
     jae     .rc_done
-    cmp     dword [rel tp_mode], 2
-    je      .rc_item
+    cmp     dword [rel tp_mode], 0
+    jne     .rc_item
     lea     r8, [rcx + 1]               ; h1
     mov     rdi, [rel tp_W]
     mov     rsi, [rel tp_x]
@@ -358,7 +338,6 @@ tp_matmul_q8_0:
     pop     rsi
     pop     rdi
 %endif
-.dispatch:
     mov     rax, [rel tp_n_threads]
     cmp     rax, 1
     jle     .single_thread
@@ -428,17 +407,8 @@ tp_matmul_q8_0:
 %endif
     xor     r8d, r8d                    ; r0 = 0
     mov     r9,  rax                    ; r1
-%if FAST_Q8
-    cmp     dword [rel tp_mode], 0
-    jne     .main_batch
-%endif
     call    matmul_q8_0_range
     jmp     .wait_workers
-%if FAST_Q8
-.main_batch:
-    call    matmul_q8_0_batch_range
-    jmp     .wait_workers
-%endif
 %if FAST_Q8
 .main_attn:
     xor     ecx, ecx                    ; h0 = 0
@@ -476,49 +446,7 @@ tp_matmul_q8_0:
     mov     r9,  rcx                    ; r1 = M
     mov     rcx, r8                     ; K
     xor     r8d, r8d                    ; r0 = 0
-%if FAST_Q8
-    cmp     dword [rel tp_mode], 0
-    jne     matmul_q8_0_batch_range
-%endif
     jmp     matmul_q8_0_range
-
-%if FAST_Q8
-; ----------------------------------------------------------------------------
-; void tp_matmul_batch(const void *W, const float *X, float *OUT, uint64 M,
-;                      uint64 K, uint64 B)   X token stride: g_mm_xstride bytes
-; Batched prefill GEMM: OUT[t][0..M) = W . X[t] for t < B, rows split across
-; the pool exactly like tp_matmul_q8_0. X = NULL: the activations are already
-; in the q8b slots (quantized by the pool jobs of transformer_forward_batch).
-; ----------------------------------------------------------------------------
-tp_matmul_batch:
-    test    rsi, rsi
-    jz      .quantized
-    push    rdi
-    push    rsi
-    push    rdx
-    push    rcx
-    push    r8
-    push    r9
-    sub     rsp, 8
-    mov     rdi, rsi                    ; X
-    mov     rsi, r8                     ; K
-    mov     rdx, r9                     ; B
-    mov     rcx, [rel g_mm_xstride]
-    call    quantize_x_batch
-    add     rsp, 8
-    pop     r9
-    pop     r8
-    pop     rcx
-    pop     rdx
-    pop     rsi
-    pop     rdi
-.quantized:
-    mov     [rel g_mm_b], r9
-    lea     rax, [rcx * 4]
-    mov     [rel g_mm_m4], rax
-    mov     dword [rel tp_mode], 1
-    jmp     tp_matmul_q8_0.dispatch
-%endif
 
 %if FAST_Q8
 ; ----------------------------------------------------------------------------
@@ -568,8 +496,8 @@ tp_gqa_attn:
 ; ----------------------------------------------------------------------------
 ; void tp_for(void (*fn)(uint64), uint64 n)
 ; Runs fn(i) for every i < n, chunks claimed dynamically by the pool; fn must
-; keep the SysV callee-saved registers. Used by the batched prefill for the
-; attention items and the per-token steps.
+; keep the SysV callee-saved registers. Every job of the batched prefill is
+; such an item job (transformer.asm).
 ; ----------------------------------------------------------------------------
 tp_for:
     push    rbx
@@ -581,8 +509,8 @@ tp_for:
     mov     rbx, rax
     mov     [rel tp_fn], rdi
     mov     [rel tp_M], rsi
-    mov     qword [rel tp_K], 0         ; item job ...
-    mov     dword [rel tp_mode], 2      ; ... that calls tp_fn
+    mov     qword [rel tp_K], 0         ; no GEMV ...
+    mov     dword [rel tp_mode], 1      ; ... but an item job
     mov     dword [rel tp_next], 0
 
     mov     r12d, 1
@@ -630,7 +558,7 @@ tp_out:       resq 1
 tp_M:         resq 1
 tp_K:         resq 1
 tp_fn:        resq 1                    ; item function of a tp_for job
-tp_mode:      resd 1                    ; 0 = GEMV, 1 = batched GEMM, 2 = tp_fn(i) items
+tp_mode:      resd 1                    ; 0 = GEMV / attention heads, 1 = tp_fn(i) items
 tp_chunk_shift: resd 1                  ; log2(rows per claimed chunk)
 
 alignb 64
