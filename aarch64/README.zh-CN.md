@@ -43,7 +43,7 @@ DDR 固定时的预填充速度（token/秒）：本移植版在 1 / 2 / 4 个 A
 - **小核。** DDR 固定时，llama.cpp 在 A55 上快 1.3–1.6 倍。
 - **内存频率。** 在默认调频策略下，只有 A55 工作时内存停留在 534 MHz；只要有一个 A76 工作，内存就升到 2400 MHz。因此默认情况下只用 A55 的任务内存带宽不足：固定 DDR 后，本移植版在单个 A55 上提速 49%。
 - **大小核混用。** 在 4 个 A76 之外再加上 A55，两个引擎都会变慢，因为内存带宽已经饱和。请使用 4 个大核：在允许使用全部核心时，`-t 4` 会自动选择 A76。
-- **预填充**已改为批处理：比 llama.cpp 慢 1.2–1.8 倍（之前为 2.3–5 倍）。
+- **预填充**改为使用寄存器分块内核的批处理：llama.cpp 快 1.07–1.44 倍（逐 token 预填充时为 2.3–5 倍）。
 
 ## Ollama 与两个操作系统同时运行
 
@@ -82,13 +82,21 @@ Qwen3-1.7B Q8_0 的生成速度（token/秒），测试方法同上：
 
 ## 批量预填充
 
-与 x86-64 版本相同的方案，默认每批 16 个 token；在任意核心组合上，logits 都与逐 token 预填充逐位一致。34 个 token 提示词的预填充速度，Qwen3-0.6B，token/秒：
+与 x86-64 版本相同的方案，默认每批 16 个 token。每批使用重排权重上的“4 行 × 2 个 token”寄存器分块内核：每个块的权重寄存器同时服务两个 token，因此每个 token 从 L1 读取该行组的次数减半。对每个 token，int32 SDOT 求和是精确的，浮点步骤与单 token 内核相同，因此在任意核心组合上，logits 都与逐 token 预填充逐位一致。
 
-| 核心 | 逐个 token | 批量 | llama.cpp |
-|---|---:|---:|---:|
-| 4×A76 | 45 | 161 | 211–216 |
-| 1×A76 | 27 | 48 | 55–64 |
-| 4×A55 | 13 | 29 | 52 |
+单独测试内核，数据位于 L1（`aarch64/kbench.s`），每行、每个 token、每个 32 值块的周期数：A76 为 1.93（之前 2.35），A55 为 8.1（之前 11.0）。
+
+预填充速度，Qwen3-0.6B，token/秒（各 3 次，每次在温度低于 65 °C 时开始；llama.cpp 同上，`llama-bench -p 34,227`；`results/prefill-tiles.txt`）：
+
+| 核心 | 34 个 token：逐个 | 34 个 token：批量 | 34 个 token：llama.cpp | 227 个 token：批量 | 227 个 token：llama.cpp |
+|---|---:|---:|---:|---:|---:|
+| 4×A76 | 45 | 172–188 | 213 | 177–181 | 206 |
+| 1×A76 | 27 | 55–57 | 60 | 49–50 | 57 |
+| 4×A55 | 13 | 37–39 | 53 | 36 | 52 |
+
+第一版批量预填充（每次处理一组 4 行和一个 token）在 34 个 token 的提示词上为 150 / 47 / 29.5 token/秒，在 227 个 token 上为 157 / 43 / 27.8。
+
+剩余差距：在 1×A76 上处理 227 个 token 的提示词时，注意力占 4.6 秒中的 0.72 秒。它逐个 token 计算，每个缓存位置都要做一次点积和水平求和。量化、归一化和 SiLU 另占 0.2 秒。
 
 ## 构建与运行
 
@@ -96,6 +104,8 @@ Qwen3-1.7B Q8_0 的生成速度（token/秒），测试方法同上：
 aarch64/build.sh                     # 在 AArch64 Linux 机器上（GNU as + ld）
 taskset -c 4-7 build/asm-llm-arm64 -m models/qwen3-0.6b-q8_0.asmbin -p "..." -n 64 -t 4
 aarch64/bench_cores.sh build/asm-llm-arm64 <model.asmbin> <llama-bench> <model.gguf> 3 out.csv
+(cd aarch64 && as -o ../build/kbench.o kbench.s && ld -static -o ../build/kbench ../build/kbench.o ../build/aarch64/matmul.o)
+taskset -c 4 python3 aarch64/kbench.py build/kbench 1   # A76 上的内核周期数；A55 用 cpu0 和 0
 ```
 
 模型文件与 x86-64 版本相同，都是 `.asmbin` v2（`scripts/export_weights.py --scale-dtype fp16`）。

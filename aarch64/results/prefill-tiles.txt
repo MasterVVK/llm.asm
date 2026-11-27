@@ -1,0 +1,33 @@
+# Batched prefill with the 4 row x 2 token register tile, Qwen3-0.6B Q8_0.
+# CM3588 (RK3588), default DDR governor, --batch 16 (default), taskset per core set.
+# Every run started below 65 C. Tokens per second; asm-llm: 3 runs; llama.cpp b12810:
+# llama-bench -p 34,227 -n 0 -r 3 -ngl 0 (mean, sd).
+cores   first_pp34            tile_pp34             llama_pp34      first_pp227           tile_pp227            llama_pp227
+4xA76   148.61 150.26 152.15  188.17 171.82 175.94  213.31 (2.32)   156.92 156.65 157.25  180.87 177.50 176.49  205.81 (2.74)
+1xA76   48.68 44.41 46.94     56.87 56.37 54.63     60.18 (4.29)    43.20 43.12 42.87     49.49 49.74 48.88     57.03 (0.34)
+4xA55   29.51 29.20 29.70     38.70 39.07 37.17     52.70 (0.41)    27.82 27.75 27.84     36.25 35.79 35.91     52.39 (0.13)
+# first = first batched version (one 4-row group and one token at a time)
+
+# Kernel alone (aarch64/kbench.s), cycles per (row, token, 32-value block), data in L1/L2.
+core          K     M    B   gemv   first_batch  tile_4x2
+A76 2.28GHz   1024  16   8   2.32   2.35         1.92
+A76 2.28GHz   1024  16   16  2.33   2.38         1.94
+A76 2.28GHz   3072  8    16  2.29   2.34         1.92
+A76 2.28GHz   1024  128  16  2.49   2.39         1.95
+A55 1.80GHz   1024  16   8   10.04  10.80        8.03
+A55 1.80GHz   1024  16   16  10.06  11.06        8.09
+A55 1.80GHz   3072  8    16  10.55  11.43        8.44
+A55 1.80GHz   1024  128  16  12.38  11.30        8.29
+
+# Where the rest goes: 227-token prompt, ms per prefill (3 runs).
+# nogemm = batched GEMM skipped (activation quantization kept); the others skip one more step.
+4xA76  full    1276.66 1277.31 1257.79
+4xA76  nogemm   486.60  498.84  494.32
+4xA55  full    6322.25 6377.08 6300.57
+4xA55  nogemm  1654.85 1658.00 1659.77
+1xA76  full    4568.46 4581.76 4559.09
+1xA76  nogemm   987.31  914.54  907.80
+1xA76  nogemm, no quantization   870.43 900.56 878.67
+1xA76  nogemm, no attention      186.61 185.45 188.45
+1xA76  nogemm, no SiLU           809.64 808.76 841.26
+1xA76  nogemm, no RMSNorm        920.96 890.16 872.99

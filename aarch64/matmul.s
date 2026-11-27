@@ -329,15 +329,23 @@ repack_q8_0_4x4:
         MM4X4 matmul_q8_0_4x4_nopf, 0
 
 
-// Batched prefill twin of MM4X4: g_mm_b tokens, out[t] at out + t * g_mm_m4.
-// For every 4-row group the per-token loop below is the GEMV block loop
-// verbatim, so results are bit-identical to token-by-token prefill; the group
-// is read from DRAM once and from L1 for the other tokens.
+// Batched prefill GEMM, 4 rows x 2 tokens register tile on the repacked
+// weights. Each block's weight registers serve both tokens, so the group is
+// read from L1 half as often per token. Per token the int32 SDOT sums are
+// exact (the split into accumulators does not matter) and the float sequence
+// is the GEMV one: scale = fp32(w scale) * x scale, acc_even/odd += sum *
+// scale (FMLA), out = acc_even + acc_odd, so results are bit-identical to
+// MM4X4. g_mm_b tokens, out[t] at out + t * g_mm_m4; an odd last token is
+// computed as both halves of the tile and stored once.
+//   v0-7 weights   v16-19 x (A: 16/17, B: 18/19)   v20-23 / v24-27 int sums
+//   of blocks b / b+1   v28-31 acc (A even, A odd, B even, B odd)   v8-14 scales
         .macro MM4X4B name, pf
 \name:
-        stp     x29, x30, [sp, #-48]!
+        stp     x29, x30, [sp, #-80]!
         stp     x19, x20, [sp, #16]
         stp     x21, x22, [sp, #32]
+        stp     x23, x24, [sp, #48]
+        stp     x25, x26, [sp, #64]
         cmp     x4, x3
         b.ls    9f
         add     x5, x2, x2, lsr #4      // row_stride
@@ -352,78 +360,128 @@ repack_q8_0_4x4:
         ldr     x19, [x19]
         ADR_L   x20, g_mm_m4
         ldr     x20, [x20]
-        mov     x7, #XQ_STRIDE
-1:      ADR_L   x14, q8b_xq
+1:      ADR_L   x14, q8b_xq             // token A slots
         ADR_L   x15, q8b_xs
-        mov     x21, x1
-        mov     x22, x19
-2:      mov     x11, x10                // weights
+        mov     x21, x1                 // out of token A
+        mov     x22, x19                // tokens left
+2:      mov     x25, #XQ_STRIDE         // token B = A + 1
+        mov     x26, #XS_STRIDE
+        cmp     x22, #2
+        b.hs    4f
+        mov     x25, #0                 // odd last token: B = A, not stored
+        mov     x26, #0
+4:      mov     x11, x10                // weights
         add     x12, x10, x2, lsl #2    // fp16 scales
         mov     x13, x14
+        add     x23, x14, x25
         mov     x16, x15
-        movi    v24.4s, #0
-        movi    v25.4s, #0
-        mov     x17, x9
-3:      ld1     {v0.16b, v1.16b, v2.16b, v3.16b}, [x11], #64   // block b, k-groups 0..3
-        ldp     q16, q17, [x13], #32    // x block b
+        add     x24, x15, x26
         movi    v28.4s, #0
         movi    v29.4s, #0
-        sdot    v28.4s, v0.16b, v16.4b[0]
-        sdot    v29.4s, v1.16b, v16.4b[1]
-        ld1     {v4.16b, v5.16b, v6.16b, v7.16b}, [x11], #64   // k-groups 4..7
-        sdot    v28.4s, v2.16b, v16.4b[2]
-        sdot    v29.4s, v3.16b, v16.4b[3]
-        ldp     q18, q19, [x13], #32    // x block b+1
-        sdot    v28.4s, v4.16b, v17.4b[0]
-        sdot    v29.4s, v5.16b, v17.4b[1]
-        ld1     {v0.16b, v1.16b, v2.16b, v3.16b}, [x11], #64   // block b+1
         movi    v30.4s, #0
         movi    v31.4s, #0
-        sdot    v28.4s, v6.16b, v17.4b[2]
-        sdot    v29.4s, v7.16b, v17.4b[3]
-        sdot    v30.4s, v0.16b, v18.4b[0]
-        sdot    v31.4s, v1.16b, v18.4b[1]
+        mov     x17, x9
+3:      ld1     {v0.16b, v1.16b, v2.16b, v3.16b}, [x11], #64   // block b, k-groups 0..3
+        ldr     q16, [x13], #16
+        ldr     q18, [x23], #16
+        movi    v20.4s, #0
+        movi    v21.4s, #0
+        movi    v22.4s, #0
+        movi    v23.4s, #0
+        sdot    v20.4s, v0.16b, v16.4b[0]
+        sdot    v22.4s, v0.16b, v18.4b[0]
+        sdot    v21.4s, v1.16b, v16.4b[1]
+        sdot    v23.4s, v1.16b, v18.4b[1]
+        ld1     {v4.16b, v5.16b, v6.16b, v7.16b}, [x11], #64   // k-groups 4..7
+        sdot    v20.4s, v2.16b, v16.4b[2]
+        sdot    v22.4s, v2.16b, v18.4b[2]
+        ldr     q17, [x13], #16
+        sdot    v21.4s, v3.16b, v16.4b[3]
+        sdot    v23.4s, v3.16b, v18.4b[3]
+        ldr     q19, [x23], #16
+        sdot    v20.4s, v4.16b, v17.4b[0]
+        sdot    v22.4s, v4.16b, v19.4b[0]
+        ld1     {v0.16b, v1.16b, v2.16b, v3.16b}, [x11], #64   // block b+1
+        sdot    v21.4s, v5.16b, v17.4b[1]
+        sdot    v23.4s, v5.16b, v19.4b[1]
+        ldr     q16, [x13], #16
+        sdot    v20.4s, v6.16b, v17.4b[2]
+        sdot    v22.4s, v6.16b, v19.4b[2]
+        ldr     q18, [x23], #16
+        sdot    v21.4s, v7.16b, v17.4b[3]
+        sdot    v23.4s, v7.16b, v19.4b[3]
+        movi    v24.4s, #0
+        movi    v25.4s, #0
+        movi    v26.4s, #0
+        movi    v27.4s, #0
+        ldr     q8, [x12], #16          // fp16 scales: 4 rows x 2 blocks
+        sdot    v24.4s, v0.16b, v16.4b[0]
+        sdot    v26.4s, v0.16b, v18.4b[0]
+        sdot    v25.4s, v1.16b, v16.4b[1]
+        sdot    v27.4s, v1.16b, v18.4b[1]
         ld1     {v4.16b, v5.16b, v6.16b, v7.16b}, [x11], #64
-        ldr     q26, [x12], #16         // fp16 scales: 4 rows x 2 blocks
-        sdot    v30.4s, v2.16b, v18.4b[2]
-        sdot    v31.4s, v3.16b, v18.4b[3]
-        ldr     d27, [x16], #8          // x scales of both blocks
-        sdot    v30.4s, v4.16b, v19.4b[0]
-        sdot    v31.4s, v5.16b, v19.4b[1]
-        fcvtl   v20.4s, v26.4h
-        fcvtl2  v21.4s, v26.8h
-        sdot    v30.4s, v6.16b, v19.4b[2]
-        sdot    v31.4s, v7.16b, v19.4b[3]
-        add     v28.4s, v28.4s, v29.4s
-        fmul    v20.4s, v20.4s, v27.s[0]
-        fmul    v21.4s, v21.4s, v27.s[1]
-        add     v30.4s, v30.4s, v31.4s
-        scvtf   v28.4s, v28.4s
-        scvtf   v30.4s, v30.4s
+        add     v20.4s, v20.4s, v21.4s
+        add     v22.4s, v22.4s, v23.4s
+        sdot    v24.4s, v2.16b, v16.4b[2]
+        sdot    v26.4s, v2.16b, v18.4b[2]
+        ldr     q17, [x13], #16
+        fcvtl   v11.4s, v8.4h
+        fcvtl2  v12.4s, v8.8h
+        sdot    v25.4s, v3.16b, v16.4b[3]
+        sdot    v27.4s, v3.16b, v18.4b[3]
+        ldr     q19, [x23], #16
+        ldr     d9, [x16], #8           // x scales of A (b, b+1)
+        ldr     d10, [x24], #8          // x scales of B
+        scvtf   v20.4s, v20.4s
+        scvtf   v22.4s, v22.4s
+        sdot    v24.4s, v4.16b, v17.4b[0]
+        sdot    v26.4s, v4.16b, v19.4b[0]
+        fmul    v13.4s, v11.4s, v9.s[0]
+        fmul    v14.4s, v11.4s, v10.s[0]
+        sdot    v25.4s, v5.16b, v17.4b[1]
+        sdot    v27.4s, v5.16b, v19.4b[1]
+        fmla    v28.4s, v20.4s, v13.4s
+        fmla    v30.4s, v22.4s, v14.4s
+        sdot    v24.4s, v6.16b, v17.4b[2]
+        sdot    v26.4s, v6.16b, v19.4b[2]
+        fmul    v13.4s, v12.4s, v9.s[1]
+        fmul    v14.4s, v12.4s, v10.s[1]
+        sdot    v25.4s, v7.16b, v17.4b[3]
+        sdot    v27.4s, v7.16b, v19.4b[3]
+        add     v24.4s, v24.4s, v25.4s
+        add     v26.4s, v26.4s, v27.4s
         .if \pf
-        prfm    pldl1keep, [x11, #PF_DIST]       // one prefetch per 64-byte line
+        prfm    pldl1keep, [x11, #PF_DIST]
         prfm    pldl1keep, [x11, #(PF_DIST + 64)]
         prfm    pldl1keep, [x11, #(PF_DIST + 128)]
         prfm    pldl1keep, [x11, #(PF_DIST + 192)]
         .endif
-        fmla    v24.4s, v28.4s, v20.4s
-        fmla    v25.4s, v30.4s, v21.4s
+        scvtf   v24.4s, v24.4s
+        scvtf   v26.4s, v26.4s
+        fmla    v29.4s, v24.4s, v13.4s
+        fmla    v31.4s, v26.4s, v14.4s
         subs    x17, x17, #1
         b.ne    3b
-        fadd    v24.4s, v24.4s, v25.4s
-        str     q24, [x21]              // rows 4g .. 4g+3 of token t
+        fadd    v28.4s, v28.4s, v29.4s
+        str     q28, [x21]              // rows 4g .. 4g+3 of token A
+        cbz     x25, 5f
+        fadd    v30.4s, v30.4s, v31.4s
         add     x21, x21, x20
-        add     x14, x14, x7
-        add     x15, x15, #XS_STRIDE
-        subs    x22, x22, #1
+        str     q30, [x21]              // token B
+        add     x21, x21, x20
+        add     x14, x14, x25, lsl #1
+        add     x15, x15, x26, lsl #1
+        subs    x22, x22, #2
         b.ne    2b
-        add     x1, x1, #16
+5:      add     x1, x1, #16
         add     x10, x10, x6
         subs    x4, x4, #1
         b.ne    1b
-9:      ldp     x21, x22, [sp, #32]
+9:      ldp     x25, x26, [sp, #64]
+        ldp     x23, x24, [sp, #48]
+        ldp     x21, x22, [sp, #32]
         ldp     x19, x20, [sp, #16]
-        ldp     x29, x30, [sp], #48
+        ldp     x29, x30, [sp], #80
         ret
         .endm
 

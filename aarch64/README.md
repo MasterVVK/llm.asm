@@ -43,7 +43,7 @@ Prefill with DDR fixed, tokens per second: this port 26.8 / 37.8 / 44.6 on 1 / 2
 - **Little cores.** llama.cpp is 1.3–1.6× faster on A55 with DDR fixed.
 - **DDR frequency.** With the default governor, work on A55 cores alone keeps the memory at 534 MHz, while any A76 at work raises it to 2400 MHz. A55-only workloads are therefore memory-starved by default: on one A55 this port gains 49% when DDR is fixed.
 - **Mixing.** Adding A55 cores to the four A76 slows both engines down, because memory bandwidth is already saturated. Use the 4 big cores: with all cores allowed, `-t 4` picks the A76 automatically.
-- **Prefill** is batched now: 1.2–1.8× slower than llama.cpp (it was 2.3–5×).
+- **Prefill** is batched with a register-tiled kernel: llama.cpp is 1.07–1.44× faster (it was 2.3–5× with token-by-token prefill).
 
 ## Ollama and two OSes at once
 
@@ -82,13 +82,21 @@ Qwen3-1.7B Q8_0, decode in tokens per second, same method as above:
 
 ## Batched prefill
 
-Same scheme as the x86-64 build, 16 tokens per pass by default; logits are bit-identical to token-by-token prefill on every core set. Prefill of the 34-token prompt, Qwen3-0.6B, tokens per second:
+Same scheme as the x86-64 build, 16 tokens per pass by default. The pass kernel is a 4 row × 2 token register tile on the repacked weights: the weight registers of each block serve both tokens, so per token the row group is read from L1 half as often. Per token the int32 SDOT sums are exact and the float steps are those of the single-token kernel, so the logits are bit-identical to token-by-token prefill on every core set.
 
-| Cores | Token by token | Batched | llama.cpp |
-|---|---:|---:|---:|
-| 4×A76 | 45 | 161 | 211–216 |
-| 1×A76 | 27 | 48 | 55–64 |
-| 4×A55 | 13 | 29 | 52 |
+Kernel alone, data in L1 (`aarch64/kbench.s`), cycles per row, token and 32-value block: A76 1.93 (was 2.35), A55 8.1 (was 11.0).
+
+Prefill, Qwen3-0.6B, tokens per second (3 runs, each started below 65 °C; llama.cpp as above, `llama-bench -p 34,227`; `results/prefill-tiles.txt`):
+
+| Cores | 34 tokens: token by token | 34 tokens: batched | 34 tokens: llama.cpp | 227 tokens: batched | 227 tokens: llama.cpp |
+|---|---:|---:|---:|---:|---:|
+| 4×A76 | 45 | 172–188 | 213 | 177–181 | 206 |
+| 1×A76 | 27 | 55–57 | 60 | 49–50 | 57 |
+| 4×A55 | 13 | 37–39 | 53 | 36 | 52 |
+
+The first batched version (one 4-row group and one token at a time) reached 150 / 47 / 29.5 tok/s on the 34-token prompt and 157 / 43 / 27.8 on the 227-token one.
+
+What is left: on 1×A76 with the 227-token prompt, attention takes 0.72 s of 4.6 s. It runs token by token, with a dot product and a horizontal sum for every cached position. Quantization, norms and SiLU take another 0.2 s.
 
 ## Build and run
 
@@ -96,6 +104,8 @@ Same scheme as the x86-64 build, 16 tokens per pass by default; logits are bit-i
 aarch64/build.sh                     # on an AArch64 Linux machine (GNU as + ld)
 taskset -c 4-7 build/asm-llm-arm64 -m models/qwen3-0.6b-q8_0.asmbin -p "..." -n 64 -t 4
 aarch64/bench_cores.sh build/asm-llm-arm64 <model.asmbin> <llama-bench> <model.gguf> 3 out.csv
+(cd aarch64 && as -o ../build/kbench.o kbench.s && ld -static -o ../build/kbench ../build/kbench.o ../build/aarch64/matmul.o)
+taskset -c 4 python3 aarch64/kbench.py build/kbench 1   # kernel cycles on an A76; use cpu0 and 0 for an A55
 ```
 
 The model file is the same `.asmbin` v2 as for x86-64 (`scripts/export_weights.py --scale-dtype fp16`).
