@@ -11,6 +11,7 @@ default rel
 %include "constants.inc"
 
 extern g_ctx
+extern g_use_hugepages
 extern sys_openat_wr
 extern sys_close
 extern sys_write_all
@@ -155,8 +156,26 @@ _start:
     lea     rsi, [rel flg_raw]
     call    str_eq
     test    eax, eax
-    jz      .chk_tokens
+    jz      .chk_hp
     mov     dword [rel opt_raw], 1
+    jmp     .arg_next
+
+.chk_hp:
+    mov     rdi, r14
+    lea     rsi, [rel flg_hp]
+    call    str_eq
+    test    eax, eax
+    jz      .chk_nohp
+    mov     dword [rel g_use_hugepages], 1
+    jmp     .arg_next
+
+.chk_nohp:
+    mov     rdi, r14
+    lea     rsi, [rel flg_nohp]
+    call    str_eq
+    test    eax, eax
+    jz      .chk_tokens
+    mov     dword [rel g_use_hugepages], 0
     jmp     .arg_next
 
 .chk_tokens:
@@ -944,6 +963,8 @@ flg_t:          db "-t", 0
 flg_c:          db "-c", 0
 flg_think:      db "--think", 0
 flg_raw:        db "--raw", 0
+flg_hp:         db "--hugepages", 0
+flg_nohp:       db "--nohugepages", 0
 flg_tokens:     db "--tokens", 0
 flg_temp:       db "--temp", 0
 flg_topp:       db "--topp", 0

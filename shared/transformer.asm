@@ -48,6 +48,7 @@ extern tp_gqa_attn
 section .text
 
 global g_ctx
+global g_use_hugepages
 global model_init
 global model_free
 global transformer_forward
@@ -97,12 +98,16 @@ model_init:
     js      .err_close
     mov     r14, [rsp + STAT_ST_SIZE]   ; file size
 
+    cmp     dword [rel g_use_hugepages], 0
+    jne     .huge_copy
+
     ; mmap entire .asmbin read-only
     mov     rdi, r14
     mov     rsi, r13
     call    sys_mmap_file
     mov     r15, rax                    ; mmap_base
 
+.close_fd:
     ; Close fd (mmap keeps mapping alive)
     mov     rdi, r13
     call    sys_close
@@ -325,6 +330,44 @@ model_init:
     mov     rax, -3
     jmp     .ret
 %ifndef BARE_METAL
+; Copy the weights into anonymous memory aligned to 2 MiB and marked
+; MADV_HUGEPAGE: transparent huge pages cut TLB misses while the 614 MiB of
+; weights stream through every token (a file mapping stays on 4 KiB pages).
+.huge_copy:
+    lea     rdi, [r14 + HUGE_2M]
+    call    sys_mmap_anon
+    test    rax, rax
+    js      .huge_fail
+    lea     r15, [rax + HUGE_2M - 1]
+    and     r15, -HUGE_2M               ; 2 MiB aligned base
+    mov     rdi, r15
+    lea     rsi, [r14 + HUGE_2M - 1]
+    and     rsi, -HUGE_2M
+    mov     edx, MADV_HUGEPAGE
+    mov     eax, SYS_madvise
+    syscall
+    xor     ebp, ebp                    ; bytes read
+.huge_read:
+    cmp     rbp, r14
+    jae     .close_fd
+    mov     edi, r13d
+    lea     rsi, [r15 + rbp]
+    mov     rdx, r14
+    sub     rdx, rbp
+    mov     eax, SYS_read
+    syscall
+    cmp     rax, -4                     ; EINTR
+    je      .huge_read
+    test    rax, rax
+    jle     .huge_read_fail
+    add     rbp, rax
+    jmp     .huge_read
+.huge_read_fail:
+    mov     r15, -5
+    jmp     .close_fd
+.huge_fail:
+    mov     r15, rax
+    jmp     .close_fd
 .err_mmap:
     mov     rax, -2
     jmp     .ret
@@ -983,3 +1026,4 @@ t_one: dd 1.0
 section .bss
 alignb 64
 g_ctx: resb CTX_SIZE
+g_use_hugepages: resd 1

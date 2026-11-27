@@ -16,6 +16,9 @@
 %define SYS_clock_gettime   228
 %define SYS_exit_group      231
 %define SYS_openat          257
+%define SYS_madvise         28
+%define MADV_HUGEPAGE       14
+%define HUGE_2M             0x200000
 
 ; --- Linux file / mmap / clone / futex constants ---
 %define AT_FDCWD            -100

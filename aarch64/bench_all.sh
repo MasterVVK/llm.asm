@@ -6,7 +6,7 @@
 # usage: bench_all.sh <asm-llm> <model.asmbin> <llama-bench> <model.gguf> <ollama-models-dir> [runs] [out.csv]
 set -euo pipefail
 ASM=$1; ASMBIN=$2; LB=$3; GGUF=$4; OMODELS=$5; RUNS=${6:-3}; OUT=${7:-}
-PORT=11500; OMODEL=qwen3-06b-q8; COOL_MC=${COOL_MC:-70000}
+PORT=11500; OMODEL=${OMODEL:-qwen3-06b-q8}; COOL_MC=${COOL_MC:-70000}
 CONFIGS=${CONFIGS:-"A76x1:4:1 A76x4:4-7:4 A55x1:0:1 A55x4:0-3:4 all8:0-7:8"}
 PROMPT="Explain the difference between L1, L2, and L3 CPU caches and why cache locality matters."
 TEMP=/sys/class/thermal/thermal_zone0/temp

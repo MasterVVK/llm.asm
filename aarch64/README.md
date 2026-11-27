@@ -68,6 +68,18 @@ Two KVM guests at once (QEMU in Docker, a minimal Linux initramfs in each), one 
 
 Both guests together deliver less than the A76 guest alone. Within seconds the A76 guest drops from 30 to 22 tok/s while still at full clock, because the clusters share DDR and the L3. Within a minute the SoC reaches 85 °C and throttles the A76 to 1.8–2.0 GHz and the A55 to 1.2 GHz. KVM itself costs almost nothing: 34.2 tok/s in the guest, 34.3 on the host.
 
+## Automatic threads and Qwen3-1.7B
+
+Without `-t` the engine starts one thread per big core of the `taskset` mask, or one per allowed CPU when the mask has only A55 cores. A plain run on the whole board therefore lands on the four A76: 34.4 tok/s instead of 28.6 with all 8 cores. Work chunks are 16 rows when any big core takes part and 256 rows on A55-only sets: 12.8 instead of 10.3 tok/s on 4×A55. `--chunk-shift n` sets 2^n rows for experiments.
+
+Qwen3-1.7B Q8_0, decode in tokens per second, same method as above:
+
+| Cores | This port | llama.cpp | Ollama |
+|---|---:|---:|---:|
+| 1×A76 | 7.1 | 8.4 | 8.6 |
+| 4×A76 | **11.7** | 10.8 | 11.1 |
+| 4×A55 | 5.3 | 6.4 | 6.0 |
+
 ## Build and run
 
 ```bash

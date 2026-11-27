@@ -35,6 +35,22 @@ Hardware: a Proxmox VE 8.4 host with 2× Xeon E5-2696 v2 (Ivy Bridge-EP, 12 core
 
 Bare-metal OS in a diskless Proxmox VM on the same host (`results/proxmox-os-vm250.txt`): the kernel boots in 170–180 ms and the prompt appears 8 s after the VM starts. On the same prompt it decodes faster than the Linux build by 24% with 1 core, 12% with 4, 4% with 8 and 5% with 12 cores, reaching 55.4 tok/s at 12 cores.
 
+## Larger Qwen3 models
+
+The same engine runs Qwen3-1.7B and Qwen3-4B; `scripts/export_weights.py` now reads sharded checkpoints. Decode in tokens per second on the same host, median of 3 runs, llama.cpp b12810 with the official Q8_0 GGUF:
+
+| Model | Threads | This port | llama.cpp | Gain |
+|---|---:|---:|---:|---:|
+| 1.7B | 1 | 4.7 | 2.8 | +69% |
+| 1.7B | 4 | 13.6 | 10.0 | +36% |
+| 1.7B | 8 | 19.0 | 15.7 | +21% |
+| 1.7B | 16 | 19.0 | 17.0 | +12% |
+| 4B | 4 | 5.7 | 4.6 | +24% |
+| 4B | 8 | 8.4 | 7.3 | +16% |
+| 4B | 16 | 8.8 | 7.8 | +13% |
+
+Prefill stays 1.4–3.4× slower than llama.cpp. `--hugepages` copies the weights into 2 MiB transparent huge pages: +8% at 4 threads for 1.7B and 4B, no gain at 8–16 threads, so it is off by default.
+
 ## Limitations
 
 - Prefill runs token by token, so it is 1.5–4× slower than llama.cpp. With long prompts llama.cpp wins on total time.

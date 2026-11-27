@@ -1,0 +1,22 @@
+== auto threads (no -t)
+taskset 0-7  -> 33.28 [threads=4, a55=0]
+taskset 0-3  -> 12.90 [threads=4, a55=4]
+taskset 4-5  -> 28.45 [threads=2, a55=0]
+taskset 4-7  -> 35.34 [threads=4, a55=0]
+taskset 0    -> 3.05 [threads=1, a55=1]
+== A55x4 chunk sweep (decode tok/s, 3 runs)
+shift=4 rows=16: 9.83 9.78 10.34
+shift=6 rows=64: 9.78 10.25 9.85
+shift=7 rows=128: 10.36 10.39 10.39
+shift=8 rows=256: 12.85 12.87 12.88
+shift=9 rows=512: 10.94 10.83 10.87
+shift=10 rows=1024: 8.76 8.79 8.79
+== A76x4 chunk check
+shift=4 rows=16: 34.31 34.35 34.60
+shift=5 rows=32: 33.91 33.81 33.57
+shift=6 rows=64: 32.34 32.73 31.89
+== defaults (auto threads + auto chunk)
+taskset 0-3: 12.75 12.76 12.78
+taskset 4-7: 34.43 34.57 34.41
+taskset 0-7: 34.19 34.44 34.59
+SWEEP_DONE
