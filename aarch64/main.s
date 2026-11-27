@@ -55,8 +55,7 @@ _start:
         str     x0, [x24, #O_PROMPT]
         mov     x0, #128
         str     x0, [x24, #O_MAX_TOK]
-        mov     x0, #4
-        str     x0, [x24, #O_THREADS]
+        str     xzr, [x24, #O_THREADS]  // 0 = auto (big cores of the taskset mask)
         mov     x0, #2048
         str     x0, [x24, #O_CTX]
         mov     x0, #1
@@ -77,6 +76,7 @@ _start:
         FLAG    flg_hp, .Lopt_hp
         FLAG    flg_nohp, .Lopt_nohp
         FLAG    flg_norepack, .Lopt_norepack
+        FLAG    flg_chunk, .Lopt_chunk
         b       .Lusage
 .Lopt_m: NEXT_ARG x0
         str     x0, [x24, #O_MODEL]
@@ -111,6 +111,11 @@ _start:
 .Lopt_hp:
         mov     x0, #1
         str     x0, [x24, #O_HP]
+        b       .Lnext
+.Lopt_chunk: NEXT_ARG x0
+        bl      parse_u64
+        ADR_L   x1, tp_chunk_shift
+        str     x0, [x1]
         b       .Lnext
 .Lopt_nohp:
         str     xzr, [x24, #O_HP]
@@ -384,6 +389,7 @@ flg_dump: .asciz "--dump-logits"
 flg_hp: .asciz "--hugepages"
 flg_norepack: .asciz "--norepack"
 flg_nohp: .asciz "--nohugepages"
+flg_chunk: .asciz "--chunk-shift"
 msg_little: .asciz ", a55="
 msg_load: .asciz "[asm-llm] load   : "
 msg_ms_nl: .asciz " ms\n"
@@ -406,14 +412,15 @@ msg_usage:
         .ascii "Usage: asm-llm -m <model.asmbin> [options]\n"
         .ascii "  -p <prompt>          Prompt text (default: Hello!)\n"
         .ascii "  -n <max_tokens>      Max generated tokens (default: 128)\n"
-        .ascii "  -t <threads>         Threads (default: 4; pin cores with taskset)\n"
+        .ascii "  -t <threads>         Threads (default: one per big core of the taskset mask)\n"
         .ascii "  -c <ctx_len>         KV cache length (default: 2048)\n"
         .ascii "  --think | --raw      Qwen3 reasoning mode | no chat template\n"
         .ascii "  --print-tokens       Print PROMPT_TOKENS/GEN_TOKENS to stderr\n"
         .ascii "  --dump-logits <path> Dump float32 logits after prefill\n"
         .ascii "  --nohugepages        Do not request 2 MiB pages (default: on)\n"
         .ascii "  --hugepages          (default) 2 MiB pages; with --norepack copies the file\n"
-        .asciz "  --norepack           Row-major kernel instead of 4-row interleaved\n"
+        .ascii "  --norepack           Row-major kernel instead of 4-row interleaved\n"
+        .asciz "  --chunk-shift <n>    Rows per work chunk = 2^n (default 4; 8 on A55-only sets)\n"
 
         .bss
         .balign 8

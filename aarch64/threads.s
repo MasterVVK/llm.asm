@@ -20,24 +20,44 @@
 
 
         .text
-        .global tp_init, tp_matmul, tp_attn, tp_n_threads, g_mm_delta, tp_n_little
+        .global tp_init, tp_matmul, tp_attn, tp_n_threads, g_mm_delta, tp_n_little, tp_chunk_shift
         .global tp_kv_base, tp_pos, tp_scale, tp_gqa
 
 // void tp_init(uint64 n x0) — spawns n-1 workers (n clamped to [1, MAX_THREADS])
+// n = 0 picks the thread count automatically: one per big core of the
+// taskset mask, or one per allowed CPU when the mask has only A55 cores.
 tp_init:
         stp     x29, x30, [sp, #-32]!
         stp     x19, x20, [sp, #16]
-        cmp     x0, #1
-        mov     x1, #1
-        csel    x0, x0, x1, ge
-        cmp     x0, #MAX_THREADS
-        mov     x1, #MAX_THREADS
-        csel    x0, x0, x1, le
-        ADR_L   x1, tp_n_threads
-        str     x0, [x1]
         mov     x20, x0
         bl      tp_build_cpu_list
-        mov     x0, #0                  // main thread is tid 0
+        ADR_L   x1, tp_big_count
+        ldr     x2, [x1]
+        ADR_L   x1, tp_cpu_count
+        ldr     x3, [x1]
+        cbnz    x20, 4f
+        cmp     x2, #0
+        csel    x20, x2, x3, ne         // auto: big cores, else all allowed
+4:      cmp     x20, #1
+        mov     x1, #1
+        csel    x20, x20, x1, ge
+        cmp     x20, #MAX_THREADS
+        mov     x1, #MAX_THREADS
+        csel    x20, x20, x1, le
+        ADR_L   x1, tp_n_threads
+        str     x20, [x1]
+        // chunk size: 16 rows if any thread sits on a big core (best for A76
+        // and for mixed sets), 256 rows when every thread is on an A55, which
+        // streams memory better in long runs (+23..27% measured on 4x A55)
+        ADR_L   x1, tp_chunk_shift
+        ldr     x4, [x1]
+        cbnz    x4, 5f                  // set by --chunk-shift
+        mov     x4, #CH_SHIFT
+        mov     x5, #CH_SHIFT_LITTLE
+        cmp     x2, #0
+        csel    x4, x4, x5, ne
+        str     x4, [x1]
+5:      mov     x0, #0                  // main thread is tid 0
         bl      tp_pin_and_probe
         ADR_L   x1, tp_main_variant
         str     x0, [x1]
@@ -123,6 +143,8 @@ tp_build_cpu_list:
 4:      add     x0, x21, x22
         ADR_L   x3, tp_cpu_count
         str     x0, [x3]
+        ADR_L   x3, tp_big_count
+        str     x21, [x3]
         ldp     x21, x22, [sp, #32]
         ldp     x19, x20, [sp, #16]
         ldp     x29, x30, [sp], #176
@@ -202,9 +224,12 @@ tp_run_chunks:
         cmp     w7, #1
         b.eq    2f
         // matmul rows [c*CH, min((c+1)*CH, M))
-        mov     x5, #MM_CHUNK_ROWS
-        mul     x3, x2, x5
-        add     x4, x3, x5
+        ADR_L   x5, tp_chunk_shift
+        ldr     x5, [x5]
+        lsl     x3, x2, x5              // r0 = chunk << shift
+        mov     x4, #1
+        lsl     x4, x4, x5
+        add     x4, x3, x4
         ldr     x6, [x19, #JOB_M]
         cmp     x4, x6
         csel    x4, x4, x6, lo
@@ -307,8 +332,13 @@ tp_matmul:
         str     x20, [x0, #JOB_OUT]
         str     x22, [x0, #JOB_K]
         str     x21, [x0, #JOB_M]
-        add     x1, x21, #(MM_CHUNK_ROWS - 1)
-        lsr     x1, x1, #CH_SHIFT
+        ADR_L   x5, tp_chunk_shift
+        ldr     x5, [x5]
+        mov     x1, #1
+        lsl     x1, x1, x5
+        sub     x1, x1, #1
+        add     x1, x21, x1
+        lsr     x1, x1, x5              // chunks = ceil(M / rows)
         str     w1, [x0, #JOB_NCHUNKS]
         bl      tp_dispatch
 2:      ldp     x21, x22, [sp, #32]
@@ -363,6 +393,8 @@ tp_gqa:     .skip 4
 g_mm_delta: .skip 8                     // repacked_base - mmap_base (0 = row kernel)
 tp_main_variant: .skip 8
 tp_cpu_count: .skip 8
+tp_big_count: .skip 8
+tp_chunk_shift: .skip 8                 // log2(rows per chunk); 0 = choose in tp_init
 tp_n_little: .skip 8
 tp_cpu_list: .skip 64
 tp_little_tmp: .skip 64

@@ -91,7 +91,9 @@
         .ifndef CH_SHIFT
         .equ CH_SHIFT,          4               // 16 rows per dynamically claimed chunk
         .endif
-        .equ MM_CHUNK_ROWS,     (1 << CH_SHIFT)
+        .ifndef CH_SHIFT_LITTLE
+        .equ CH_SHIFT_LITTLE,   8               // 256 rows when only A55 cores work
+        .endif
 
 // --- Runtime context (g_ctx) ---
         .equ CTX_MMAP_BASE,     0
