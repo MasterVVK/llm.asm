@@ -1,0 +1,15 @@
+# Bare-metal OS (Ivy Bridge port) in a diskless Proxmox VE VM, 27.11.2026
+# Host: Proxmox VE 8.4, 2x Xeon E5-2696 v2 (Ivy Bridge-EP), DDR3-1600
+# VM: machine=pc, seabios, cpu=host, 2048 MiB, balloon 0, no disk, no network,
+#     ISO on sata0 (ide2 took 64 s to load the 614 MiB module, sata0 takes 8 s)
+# /bench prompt: "Explain how a CPU cache works in 3 concise sentences." (25 prompt tok, 50 gen tok)
+cores  boot_ms  decode_tok_s (3 runs)     prefill_tok_s (3 runs)
+1      171.18   13.24 13.32 13.35         17.87 18.46 18.53
+4      180.62   37.56 36.53 37.02         59.93 50.08 49.64
+8      175.77   51.90 51.37 50.48         69.79 72.17 71.37
+12     176.49   55.38 55.80 51.93         71.74 75.56 73.74
+# Same prompt, Linux build in a 32-vCPU Ubuntu 22.04 KVM guest on the same host, decode tok/s:
+threads=1  10.89 10.68 10.77
+threads=4  33.63 33.15 32.43
+threads=8  49.43 50.15 49.19
+threads=12 52.66 53.66 51.10

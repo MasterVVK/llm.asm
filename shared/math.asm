@@ -22,6 +22,26 @@
 bits 64
 default rel
 
+; Ivy Bridge port (AVX + F16C, no AVX2 / FMA): every FMA is a multiply and
+; an add (two roundings instead of one), and 256-bit integer ops run on two
+; 128-bit halves. Function names keep the upstream "_avx2" suffix.
+
+; a = a * b + c   (replaces vfmadd213sd / vfmadd213ps; c may be memory)
+%macro MADD213SD 3
+    vmulsd  %1, %1, %2
+    vaddsd  %1, %1, %3
+%endmacro
+%macro MADD213PS 3
+    vmulps  %1, %1, %2
+    vaddps  %1, %1, %3
+%endmacro
+
+; ymmN = broadcast(xmmN[0])   (vbroadcastss with a register source is AVX2)
+%macro BCAST_SS 1
+    vshufps xmm%1, xmm%1, xmm%1, 0
+    vinsertf128 ymm%1, ymm%1, xmm%1, 1
+%endmacro
+
 section .text
 
 global fast_expf_avx2
@@ -59,29 +79,37 @@ fast_expf_avx2:
     vcvtps2dq ymm2, ymm1                ; k_i = (int32)k_f
 
     ; Cody-Waite range reduction: r = (x - k_f*ln2_hi) - k_f*ln2_lo
+    ; (ln2_hi has 9 significant bits, so k_f*ln2_hi is exact without FMA)
     vbroadcastss ymm4, [rel f_ln2_hi]
-    vfnmadd231ps ymm0, ymm1, ymm4
+    vmulps  ymm4, ymm1, ymm4
+    vsubps  ymm0, ymm0, ymm4
     vbroadcastss ymm4, [rel f_ln2_lo]
-    vfnmadd231ps ymm0, ymm1, ymm4
+    vmulps  ymm4, ymm1, ymm4
+    vsubps  ymm0, ymm0, ymm4
 
     ; Horner degree-6: 1 + r*(1 + r*(c2 + r*(c3 + r*(c4 + r*(c5 + r*c6)))))
     vbroadcastss ymm3, [rel f_exp_c6]
     vbroadcastss ymm4, [rel f_exp_c5]
-    vfmadd213ps ymm3, ymm0, ymm4
+    MADD213PS ymm3, ymm0, ymm4
     vbroadcastss ymm4, [rel f_exp_c4]
-    vfmadd213ps ymm3, ymm0, ymm4
+    MADD213PS ymm3, ymm0, ymm4
     vbroadcastss ymm4, [rel f_exp_c3]
-    vfmadd213ps ymm3, ymm0, ymm4
+    MADD213PS ymm3, ymm0, ymm4
     vbroadcastss ymm4, [rel f_exp_c2]
-    vfmadd213ps ymm3, ymm0, ymm4
+    MADD213PS ymm3, ymm0, ymm4
     vbroadcastss ymm4, [rel f_one]
-    vfmadd213ps ymm3, ymm0, ymm4
-    vfmadd213ps ymm3, ymm0, ymm4
+    MADD213PS ymm3, ymm0, ymm4
+    MADD213PS ymm3, ymm0, ymm4
 
-    ; Reconstruct 2^k via IEEE-754 exponent shift: (k + 127) << 23
-    vpbroadcastd ymm4, [rel i_127]
-    vpaddd  ymm2, ymm2, ymm4
-    vpslld  ymm2, ymm2, 23
+    ; Reconstruct 2^k via IEEE-754 exponent shift: (k + 127) << 23,
+    ; on two 128-bit halves (k_f in ymm1 is dead by now)
+    vmovdqa xmm4, [rel i_127x4]
+    vextractf128 xmm1, ymm2, 1
+    vpaddd  xmm2, xmm2, xmm4
+    vpaddd  xmm1, xmm1, xmm4
+    vpslld  xmm2, xmm2, 23
+    vpslld  xmm1, xmm1, 23
+    vinsertf128 ymm2, ymm2, xmm1, 1
     vmulps  ymm0, ymm3, ymm2
     vandps  ymm0, ymm0, ymm5            ; flush underflowed lanes to 0.0
     ret
@@ -90,7 +118,7 @@ fast_expf_avx2:
 ; xmm0 = fast_expf_scalar(xmm0)
 ; ----------------------------------------------------------------------------
 fast_expf_scalar:
-    vbroadcastss ymm0, xmm0
+    BCAST_SS 0
     call    fast_expf_avx2
     ret
 
@@ -106,29 +134,30 @@ fast_sincos_f64:
     vcvtsd2si rax, xmm1                 ; q = (int64)q_d
 
     ; r = (x - q_d * pio2_hi) - q_d * pio2_lo
-    vmovsd  xmm2, [rel d_pio2_hi]
-    vfnmadd231sd xmm0, xmm1, xmm2
-    vmovsd  xmm2, [rel d_pio2_lo]
-    vfnmadd231sd xmm0, xmm1, xmm2       ; xmm0 = r in [-pi/4, +pi/4]
+    ; (pio2_hi has 33 significant bits: q_d * pio2_hi is exact for |q| < 2^20)
+    vmulsd  xmm2, xmm1, [rel d_pio2_hi]
+    vsubsd  xmm0, xmm0, xmm2
+    vmulsd  xmm2, xmm1, [rel d_pio2_lo]
+    vsubsd  xmm0, xmm0, xmm2            ; xmm0 = r in [-pi/4, +pi/4]
 
     vmulsd  xmm2, xmm0, xmm0            ; xmm2 = r^2
 
     ; sin(r) = r * (1 + r2*(s1 + r2*(s2 + r2*(s3 + r2*(s4 + r2*s5)))))
     vmovsd  xmm3, [rel d_sin_s5]
-    vfmadd213sd xmm3, xmm2, [rel d_sin_s4]
-    vfmadd213sd xmm3, xmm2, [rel d_sin_s3]
-    vfmadd213sd xmm3, xmm2, [rel d_sin_s2]
-    vfmadd213sd xmm3, xmm2, [rel d_sin_s1]
-    vfmadd213sd xmm3, xmm2, [rel d_one]
+    MADD213SD xmm3, xmm2, [rel d_sin_s4]
+    MADD213SD xmm3, xmm2, [rel d_sin_s3]
+    MADD213SD xmm3, xmm2, [rel d_sin_s2]
+    MADD213SD xmm3, xmm2, [rel d_sin_s1]
+    MADD213SD xmm3, xmm2, [rel d_one]
     vmulsd  xmm3, xmm3, xmm0            ; xmm3 = sin(r)
 
     ; cos(r) = 1 + r2*(c1 + r2*(c2 + r2*(c3 + r2*(c4 + r2*c5))))
     vmovsd  xmm4, [rel d_cos_c5]
-    vfmadd213sd xmm4, xmm2, [rel d_cos_c4]
-    vfmadd213sd xmm4, xmm2, [rel d_cos_c3]
-    vfmadd213sd xmm4, xmm2, [rel d_cos_c2]
-    vfmadd213sd xmm4, xmm2, [rel d_cos_c1]
-    vfmadd213sd xmm4, xmm2, [rel d_one] ; xmm4 = cos(r)
+    MADD213SD xmm4, xmm2, [rel d_cos_c4]
+    MADD213SD xmm4, xmm2, [rel d_cos_c3]
+    MADD213SD xmm4, xmm2, [rel d_cos_c2]
+    MADD213SD xmm4, xmm2, [rel d_cos_c1]
+    MADD213SD xmm4, xmm2, [rel d_one] ; xmm4 = cos(r)
 
     ; Quadrant selection based on q & 3
     and     eax, 3
@@ -201,17 +230,18 @@ log_f64:
 
     ; Horner: 1 + u^2*(1/3 + u^2*(1/5 + u^2*(1/7 + u^2*(1/9 + u^2*(1/11 + u^2/13)))))
     vmovsd  xmm3, [rel d_inv13]
-    vfmadd213sd xmm3, xmm2, [rel d_inv11]
-    vfmadd213sd xmm3, xmm2, [rel d_inv9]
-    vfmadd213sd xmm3, xmm2, [rel d_inv7]
-    vfmadd213sd xmm3, xmm2, [rel d_inv5]
-    vfmadd213sd xmm3, xmm2, [rel d_inv3]
-    vfmadd213sd xmm3, xmm2, [rel d_one]
+    MADD213SD xmm3, xmm2, [rel d_inv11]
+    MADD213SD xmm3, xmm2, [rel d_inv9]
+    MADD213SD xmm3, xmm2, [rel d_inv7]
+    MADD213SD xmm3, xmm2, [rel d_inv5]
+    MADD213SD xmm3, xmm2, [rel d_inv3]
+    MADD213SD xmm3, xmm2, [rel d_one]
     vmulsd  xmm3, xmm3, xmm0
     vaddsd  xmm3, xmm3, xmm3            ; 2 * u * poly = ln(m)
 
     vcvtsi2sd xmm4, xmm4, rcx           ; (double)e
-    vfmadd231sd xmm3, xmm4, [rel d_ln2_full]
+    vmulsd  xmm4, xmm4, [rel d_ln2_full]
+    vaddsd  xmm3, xmm3, xmm4
     vmovapd xmm0, xmm3
     ret
 
@@ -224,23 +254,23 @@ exp_f64:
     vroundsd xmm1, xmm1, xmm1, 0        ; k_d
     vcvtsd2si rax, xmm1                 ; k
 
-    vmovsd  xmm2, [rel d_ln2_hi]
-    vfnmadd231sd xmm0, xmm1, xmm2
-    vmovsd  xmm2, [rel d_ln2_lo]
-    vfnmadd231sd xmm0, xmm1, xmm2       ; r in [-ln2/2, ln2/2]
+    vmulsd  xmm2, xmm1, [rel d_ln2_hi]
+    vsubsd  xmm0, xmm0, xmm2
+    vmulsd  xmm2, xmm1, [rel d_ln2_lo]
+    vsubsd  xmm0, xmm0, xmm2            ; r in [-ln2/2, ln2/2]
 
     ; Degree-10 Horner
     vmovsd  xmm3, [rel d_e10]
-    vfmadd213sd xmm3, xmm0, [rel d_e9]
-    vfmadd213sd xmm3, xmm0, [rel d_e8]
-    vfmadd213sd xmm3, xmm0, [rel d_e7]
-    vfmadd213sd xmm3, xmm0, [rel d_e6]
-    vfmadd213sd xmm3, xmm0, [rel d_e5]
-    vfmadd213sd xmm3, xmm0, [rel d_e4]
-    vfmadd213sd xmm3, xmm0, [rel d_e3]
-    vfmadd213sd xmm3, xmm0, [rel d_half]
-    vfmadd213sd xmm3, xmm0, [rel d_one]
-    vfmadd213sd xmm3, xmm0, [rel d_one]
+    MADD213SD xmm3, xmm0, [rel d_e9]
+    MADD213SD xmm3, xmm0, [rel d_e8]
+    MADD213SD xmm3, xmm0, [rel d_e7]
+    MADD213SD xmm3, xmm0, [rel d_e6]
+    MADD213SD xmm3, xmm0, [rel d_e5]
+    MADD213SD xmm3, xmm0, [rel d_e4]
+    MADD213SD xmm3, xmm0, [rel d_e3]
+    MADD213SD xmm3, xmm0, [rel d_half]
+    MADD213SD xmm3, xmm0, [rel d_one]
+    MADD213SD xmm3, xmm0, [rel d_one]
 
     add     rax, 1023
     shl     rax, 52
@@ -356,9 +386,11 @@ rope_apply_avx2:
     vmovups ymm2, [rsi + rax]           ; cos
     vmovups ymm3, [rdx + rax]           ; sin
     vmulps  ymm4, ymm0, ymm2            ; x1 * cos
-    vfnmadd231ps ymm4, ymm1, ymm3       ; x1 * cos - x2 * sin
+    vmulps  ymm5, ymm1, ymm3            ; x2 * sin
+    vsubps  ymm4, ymm4, ymm5            ; x1 * cos - x2 * sin
     vmulps  ymm5, ymm1, ymm2            ; x2 * cos
-    vfmadd231ps ymm5, ymm0, ymm3        ; x2 * cos + x1 * sin
+    vmulps  ymm0, ymm0, ymm3            ; x1 * sin (x1 is dead after this)
+    vaddps  ymm5, ymm5, ymm0            ; x2 * cos + x1 * sin
     vmovups [rdi + rax], ymm4
     vmovups [r11 + rax], ymm5
     add     rax, 32
@@ -389,10 +421,14 @@ rmsnorm_avx2:
     vmovups ymm6, [rsi + rax + 32]
     vmovups ymm7, [rsi + rax + 64]
     vmovups ymm8, [rsi + rax + 96]
-    vfmadd231ps ymm1, ymm5, ymm5
-    vfmadd231ps ymm2, ymm6, ymm6
-    vfmadd231ps ymm3, ymm7, ymm7
-    vfmadd231ps ymm4, ymm8, ymm8
+    vmulps  ymm5, ymm5, ymm5
+    vmulps  ymm6, ymm6, ymm6
+    vmulps  ymm7, ymm7, ymm7
+    vmulps  ymm8, ymm8, ymm8
+    vaddps  ymm1, ymm1, ymm5
+    vaddps  ymm2, ymm2, ymm6
+    vaddps  ymm3, ymm3, ymm7
+    vaddps  ymm4, ymm4, ymm8
     add     rax, 128
     jmp     .ss_lp
 .ss_red:
@@ -413,7 +449,7 @@ rmsnorm_avx2:
     vsqrtss xmm1, xmm1, xmm1            ; rms
     vmovss  xmm2, [rel f_one]
     vdivss  xmm1, xmm2, xmm1            ; inv_rms = 1.0 / rms
-    vbroadcastss ymm1, xmm1
+    BCAST_SS 1
 
     xor     eax, eax
 .scale_lp:
@@ -452,7 +488,7 @@ softmax_avx2:
     inc     rcx
     jmp     .max_lp
 .max_done:
-    vbroadcastss ymm6, xmm6             ; ymm6 = max_val (preserved across fast_expf_avx2)
+    BCAST_SS 6                          ; ymm6 = max_val (preserved across fast_expf_avx2)
     vxorps  ymm7, ymm7, ymm7            ; ymm7 = sum accumulator (preserved!)
     xor     ecx, ecx                    ; index i
 
@@ -492,7 +528,7 @@ softmax_avx2:
 .norm:
     vmovss  xmm0, [rel f_one]
     vdivss  xmm7, xmm0, xmm7            ; inv_sum
-    vbroadcastss ymm7, xmm7
+    BCAST_SS 7
     xor     ecx, ecx
 .norm8_lp:
     lea     rax, [rcx + 8]
@@ -533,8 +569,8 @@ silu_mul_avx2:
     shl     rdx, 2                      ; n_bytes
     mov     rbx, rdx
 
-    vpbroadcastd ymm8, [rel i_abs_mask] ; 0x7FFFFFFF (preserved across fast_expf_avx2!)
-    vpbroadcastd ymm9, [rel i_sign_mask]; 0x80000000
+    vbroadcastss ymm8, [rel i_abs_mask] ; 0x7FFFFFFF (preserved across fast_expf_avx2!)
+    vbroadcastss ymm9, [rel i_sign_mask]; 0x80000000
     vbroadcastss ymm10, [rel f_one]     ; 1.0f
 
     xor     ecx, ecx
@@ -597,10 +633,12 @@ argmax_f32:
     jb      .scalar_init
 
     sub     rsp, 64                     ; 32B vals + 32B idxs
+    ; Indices are kept as floats (exact below 2^24) because AVX1 has no
+    ; 256-bit integer add; converted back to int32 before the reduction.
     vmovups ymm0, [rdi]                 ; best_vals = x[0..7]
-    vmovdqa ymm1, [rel i_iota8]         ; best_idxs = [0..7]
-    vpbroadcastd ymm3, [rel i_eight]    ; step = [8..8]
-    vpaddd  ymm2, ymm1, ymm3            ; cur_idxs = [8..15]
+    vmovaps ymm1, [rel f_iota8]         ; best_idxs = [0..7]
+    vbroadcastss ymm3, [rel f_eight]    ; step = [8..8]
+    vaddps  ymm2, ymm1, ymm3            ; cur_idxs = [8..15]
     mov     rcx, 8
     mov     rdx, rsi
     and     rdx, -8                     ; n8 = n & ~7
@@ -611,11 +649,12 @@ argmax_f32:
     vcmpps  ymm5, ymm4, ymm0, 14        ; _CMP_GT_OS: strict > preserves first index
     vblendvps ymm0, ymm0, ymm4, ymm5
     vblendvps ymm1, ymm1, ymm2, ymm5
-    vpaddd  ymm2, ymm2, ymm3
+    vaddps  ymm2, ymm2, ymm3
     add     rcx, 8
     jmp     .v_lp
 
 .v_red:
+    vcvttps2dq ymm1, ymm1               ; float indices -> int32
     vmovups [rsp], ymm0
     vmovdqu [rsp + 32], ymm1
     vmovss  xmm0, [rsp]                 ; best_val
@@ -685,7 +724,7 @@ sample_top_p:
     ; Scale logits[i] / temp -> probs[i]
     vmovss  xmm2, [rel f_one]
     vdivss  xmm2, xmm2, xmm0            ; inv_temp
-    vbroadcastss ymm2, xmm2
+    BCAST_SS 2
     xor     eax, eax
 .sc_lp:
     lea     rcx, [rax + 8]
@@ -808,8 +847,9 @@ sample_top_p:
 
 section .rodata
 align 32
-i_iota8:     dd 0, 1, 2, 3, 4, 5, 6, 7
-i_eight:     dd 8
+f_iota8:     dd 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0
+i_127x4:     dd 127, 127, 127, 127
+f_eight:     dd 8.0
 ; Float32 constants
 f_one:       dd 1.0
 f_exp_hi:    dd 88.3762626647949

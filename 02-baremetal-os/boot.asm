@@ -187,30 +187,18 @@ long_mode_start:
     jmp     .halt_forever
 
 ; ----------------------------------------------------------------------------
-; uint32 check_cpu_features(void) -> eax = 1 if XSAVE+AVX+FMA+AVX2 supported
+; uint32 check_cpu_features(void) -> eax = 1 if XSAVE+AVX+F16C supported
+; Ivy Bridge port: AVX2 and FMA are no longer required.
 ; ----------------------------------------------------------------------------
 check_cpu_features:
     push    rbx
     mov     eax, 1
     cpuid
-    ; ECX: bit 12 (FMA), bit 26 (XSAVE), bit 28 (AVX), bit 29 (F16C)
-    mov     edx, (1 << 12) | (1 << 26) | (1 << 28) | (1 << 29)
+    ; ECX: bit 26 (XSAVE), bit 28 (AVX), bit 29 (F16C)
+    mov     edx, (1 << 26) | (1 << 28) | (1 << 29)
     and     ecx, edx
     cmp     ecx, edx
     jne     .no
-
-    ; Check max leaf >= 7
-    xor     eax, eax
-    cpuid
-    cmp     eax, 7
-    jb      .no
-
-    mov     eax, 7
-    xor     ecx, ecx
-    cpuid
-    ; EBX: bit 5 (AVX2)
-    test    ebx, (1 << 5)
-    jz      .no
 
     mov     eax, 1
     pop     rbx

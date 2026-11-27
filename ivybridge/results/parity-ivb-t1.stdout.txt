@@ -1,0 +1,6 @@
+The **L1, L2, and L3 CPU caches** are **levels of memory cache** in a CPU architecture, each designed to store data and instructions that are frequently accessed. Here's a breakdown of their differences and the importance of **cache locality**:
+
+---
+
+### **1. L1 Cache**
+-

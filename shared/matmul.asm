@@ -11,14 +11,14 @@
 ;     [row + 0 .. row + K - 1]         : K int8 weights
 ;     [row + K .. row + row_stride - 1]: K/32 fp32 block scales
 ;
-; Compile-time modes:
-;   FAST_Q8=1 (default): Q8_0 x Q8_0 INT8xINT8 AVX2 (vpabsb + vpsignb +
-;                        vpmaddubsw + vpmaddwd + vcvtdq2ps + vfmadd231ps),
-;                        1-row sequential 4-block (128B) unrolled with
-;                        next-row software prefetch for max DRAM streaming BW.
-;                        Auto-detects v1 (fp32) and v2 (fp16) scales.
-;   FAST_Q8=0 (legacy) : Q8_0 x FP32 AVX2+FMA exact FP32-activation matmul,
-;                        auto-detects v1 (fp32) and v2 (fp16) scales.
+; Ivy Bridge port (AVX + F16C, no AVX2 / FMA):
+;   FAST_Q8=1 (only mode): Q8_0 x Q8_0 INT8xINT8 on 128-bit integer SIMD
+;                        (vpsignb + vpmaddubsw + vpmaddwd + vcvtdq2ps, then
+;                        separate vmulps + vaddps), |x| precomputed once per
+;                        matmul, 1-row sequential 4-block (128B) unrolled with
+;                        next-row software prefetch. Auto-detects v1 (fp32)
+;                        and v2 (fp16) scales.
+;   FAST_Q8=0 is not ported (assembly stops with %error).
 ;
 ; Functions:
 ;   matmul_set_fp16   : (uint64 is_fp16)
@@ -87,17 +87,27 @@ dequant_row_q8_0:
     movzx   r10d, word [r8 + rax*2]     ; v2 fp16 scale[b]
     vmovd   xmm4, r10d
     vcvtph2ps xmm4, xmm4
-    vbroadcastss ymm4, xmm4
+    vshufps xmm4, xmm4, xmm4, 0
+    vinsertf128 ymm4, ymm4, xmm4, 1
 .sc_ok:
     mov     r9, rax
     shl     r9, 5                       ; b * 32 (q offset)
     mov     r10, rax
     shl     r10, 7                      ; b * 128 (out offset)
 
-    vpmovsxbd ymm0, qword [rdi + r9]
-    vpmovsxbd ymm1, qword [rdi + r9 + 8]
-    vpmovsxbd ymm2, qword [rdi + r9 + 16]
-    vpmovsxbd ymm3, qword [rdi + r9 + 24]
+    ; 256-bit vpmovsxbd is AVX2: sign-extend 4 bytes at a time, join halves
+    vpmovsxbd xmm0, dword [rdi + r9]
+    vpmovsxbd xmm5, dword [rdi + r9 + 4]
+    vinsertf128 ymm0, ymm0, xmm5, 1
+    vpmovsxbd xmm1, dword [rdi + r9 + 8]
+    vpmovsxbd xmm5, dword [rdi + r9 + 12]
+    vinsertf128 ymm1, ymm1, xmm5, 1
+    vpmovsxbd xmm2, dword [rdi + r9 + 16]
+    vpmovsxbd xmm5, dword [rdi + r9 + 20]
+    vinsertf128 ymm2, ymm2, xmm5, 1
+    vpmovsxbd xmm3, dword [rdi + r9 + 24]
+    vpmovsxbd xmm5, dword [rdi + r9 + 28]
+    vinsertf128 ymm3, ymm3, xmm5, 1
     vcvtdq2ps ymm0, ymm0
     vcvtdq2ps ymm1, ymm1
     vcvtdq2ps ymm2, ymm2
@@ -121,21 +131,25 @@ dequant_row_q8_0:
 ; void quantize_x_q8_0(const float *x, uint64 K)
 ; rdi = x (f32), rsi = K (multiple of 32, <= Q8_MAX_K)
 ; Quantizes x into Q8_0 blocks of 32 ONCE before matmul dispatch:
-;   q8_xq[0..K-1]  : int8 in [-127, 127] (32-byte aligned, fits in L1D!)
+;   q8_xq[0..K-1]  : int8 in [-127, 127] (fits in L1D)
+;   q8_xa[0..K-1]  : |q8_xq| as uint8. It does not depend on the weight row,
+;                    so it is computed here once instead of per row.
 ;   q8_xs[0..K/32] : float32 scale = max_abs / 127.0f
+; Ivy Bridge: int32 -> int8 packing runs on 128-bit halves, which keeps the
+; bytes in linear order (no vpermd fix-up needed).
 ; ----------------------------------------------------------------------------
 quantize_x_q8_0:
     mov     rcx, rsi
     shr     rcx, 5                      ; nb = K / 32
     lea     r9, [rel q8_xq]
     lea     r10, [rel q8_xs]
+    lea     r11, [rel q8_xa]
 
-    vpbroadcastd ymm12, [rel q8_abs_mask]
+    vbroadcastss ymm12, [rel q8_abs_mask]
     vmovss  xmm13, [rel q8_inv_127]
     vmovss  xmm14, [rel q8_f127]
     vxorps  xmm15, xmm15, xmm15
-    vmovdqa ymm11, [rel q8_pack_perm]
-    vpbroadcastb ymm10, [rel q8_min_i8]
+    vmovdqa xmm10, [rel q8_min_i8x16]
 
     xor     eax, eax                    ; b = 0
     xor     r8d, r8d                    ; x byte offset (b * 128)
@@ -172,7 +186,8 @@ quantize_x_q8_0:
     jbe     .qinv_ok
     vdivss  xmm6, xmm14, xmm4           ; inv_scale = 127.0f / max_abs
 .qinv_ok:
-    vbroadcastss ymm6, xmm6
+    vshufps xmm6, xmm6, xmm6, 0
+    vinsertf128 ymm6, ymm6, xmm6, 1
 
     vmulps  ymm0, ymm0, ymm6
     vmulps  ymm1, ymm1, ymm6
@@ -184,13 +199,25 @@ quantize_x_q8_0:
     vcvtps2dq ymm2, ymm2
     vcvtps2dq ymm3, ymm3
 
-    vpackssdw ymm0, ymm0, ymm1
-    vpackssdw ymm2, ymm2, ymm3
-    vpacksswb ymm0, ymm0, ymm2
-    vpermd  ymm0, ymm11, ymm0           ; restore exact linear [0..31] byte order
-    vpmaxsb ymm0, ymm0, ymm10           ; clamp >= -127 (prevents -128 overflow)
+    vextractf128 xmm4, ymm0, 1
+    vextractf128 xmm5, ymm1, 1
+    vextractf128 xmm6, ymm2, 1
+    vextractf128 xmm7, ymm3, 1
+    vpackssdw xmm0, xmm0, xmm4          ; x[0..7]   int16
+    vpackssdw xmm1, xmm1, xmm5          ; x[8..15]
+    vpackssdw xmm2, xmm2, xmm6          ; x[16..23]
+    vpackssdw xmm3, xmm3, xmm7          ; x[24..31]
+    vpacksswb xmm0, xmm0, xmm1          ; x[0..15]  int8
+    vpacksswb xmm2, xmm2, xmm3          ; x[16..31] int8
+    vpmaxsb xmm0, xmm0, xmm10           ; clamp >= -127 (prevents -128 overflow)
+    vpmaxsb xmm2, xmm2, xmm10
 
-    vmovdqa [r9 + rdx], ymm0            ; q8_xq[b*32 .. b*32+31]
+    vmovdqa [r9 + rdx], xmm0            ; q8_xq[b*32 .. b*32+31]
+    vmovdqa [r9 + rdx + 16], xmm2
+    vpabsb  xmm0, xmm0
+    vpabsb  xmm2, xmm2
+    vmovdqa [r11 + rdx], xmm0           ; q8_xa[b*32 .. b*32+31]
+    vmovdqa [r11 + rdx + 16], xmm2
 
     add     r8, 128
     add     rdx, 32
@@ -199,70 +226,62 @@ quantize_x_q8_0:
 .qdone:
     ret
 
-; Macro: 1-row x 4-block (128 bytes = 2 cache lines) INT8xINT8 AVX2 body.
+; Macro: one 32-byte Q8_0 block of the current row, AVX1 (128-bit integer).
+;   %1 = byte offset of the block inside the 128-byte group (0/32/64/96)
+;   %2 = f32x4 accumulator, %3 = vpermilps immediate picking the block scale
 ; Preconditions:
-;   rax = w (current row), r8 = s_cur = w + K (scales of current row)
-;   r11 = q8_xq, rbx = byte offset into weights (multiple of 128)
-;   ymm0..ymm3 = 4 independent f32 accumulators (hides FMA latency!)
-;   ymm12 = [s0*xs0, s1*xs1, s2*xs2, s3*xs3] duplicated in both 128b lanes
-;   ymm15 = 16x int16(1)
-; Prefetching [r8 + rbx] (= [w + K + rbx]) streams monotonically across both
-; the current row's scales and the entire next row without jumping pages or
-; resetting the CPU's L1/L2 hardware stream prefetcher.
+;   rax = w (current row), rbx = byte offset into the row (multiple of 32)
+;   r11 = q8_xq (signed x), r10 = q8_xa (|x|), xmm12 = 4 combined scales
+;   xmm15 = 8x int16(1)
+; The two 16-byte halves are summed in int32 before conversion; this is
+; exact because |sum| <= 8 * 127 * 127.
+%macro INT8_BLK_AVX1 3
+    vmovdqu    xmm6, [rax + rbx + %1]
+    vmovdqu    xmm7, [rax + rbx + %1 + 16]
+    vpsignb    xmm6, xmm6, [r11 + rbx + %1]       ; w * sign(x)
+    vpsignb    xmm7, xmm7, [r11 + rbx + %1 + 16]
+    vmovdqa    xmm4, [r10 + rbx + %1]             ; |x|
+    vmovdqa    xmm5, [r10 + rbx + %1 + 16]
+    vpmaddubsw xmm6, xmm4, xmm6                   ; 8x int16 pair sums
+    vpmaddubsw xmm7, xmm5, xmm7
+    vpmaddwd   xmm6, xmm6, xmm15                  ; 4x int32
+    vpmaddwd   xmm7, xmm7, xmm15
+    vpaddd     xmm6, xmm6, xmm7
+    vcvtdq2ps  xmm6, xmm6
+    vpermilps  xmm8, xmm12, %3
+    vmulps     xmm6, xmm6, xmm8
+    vaddps     %2, %2, xmm6
+%endmacro
+
+; 1 row x 4 blocks (128 bytes = 2 cache lines). Prefetching [r8 + rbx]
+; (= [w + K + rbx]) streams monotonically across the current row's scales
+; and the next row, as upstream does.
 %macro INT8_1ROW_4BLK 0
     Q8_PREFETCH [r8 + rbx]
     Q8_PREFETCH [r8 + rbx + 64]
+    INT8_BLK_AVX1 0,  xmm0, 0x00
+    INT8_BLK_AVX1 32, xmm1, 0x55
+    INT8_BLK_AVX1 64, xmm2, 0xAA
+    INT8_BLK_AVX1 96, xmm3, 0xFF
+%endmacro
 
-    ; Blocks 0 & 1 (+0, +32)
-    vmovdqa    ymm4,  [r11 + rbx]
-    vmovdqa    ymm10, [r11 + rbx + 32]
-    vpabsb     ymm5,  ymm4
-    vpabsb     ymm11, ymm10
-    vmovdqu    ymm6,  [rax + rbx]
-    vmovdqu    ymm7,  [rax + rbx + 32]
-    vpsignb    ymm6,  ymm6, ymm4
-    vpsignb    ymm7,  ymm7, ymm10
-    vpmaddubsw ymm6,  ymm5, ymm6
-    vpmaddubsw ymm7,  ymm11, ymm7
-    vpmaddwd   ymm6,  ymm6, ymm15
-    vpmaddwd   ymm7,  ymm7, ymm15
-    vcvtdq2ps  ymm6,  ymm6
-    vcvtdq2ps  ymm7,  ymm7
-    vpermilps  ymm8,  ymm12, 0x00
-    vpermilps  ymm9,  ymm12, 0x55
-    vfmadd231ps ymm0, ymm6, ymm8
-    vfmadd231ps ymm1, ymm7, ymm9
-
-    ; Blocks 2 & 3 (+64, +96)
-    vmovdqa    ymm4,  [r11 + rbx + 64]
-    vmovdqa    ymm10, [r11 + rbx + 96]
-    vpabsb     ymm5,  ymm4
-    vpabsb     ymm11, ymm10
-    vmovdqu    ymm6,  [rax + rbx + 64]
-    vmovdqu    ymm7,  [rax + rbx + 96]
-    vpsignb    ymm6,  ymm6, ymm4
-    vpsignb    ymm7,  ymm7, ymm10
-    vpmaddubsw ymm6,  ymm5, ymm6
-    vpmaddubsw ymm7,  ymm11, ymm7
-    vpmaddwd   ymm6,  ymm6, ymm15
-    vpmaddwd   ymm7,  ymm7, ymm15
-    vcvtdq2ps  ymm6,  ymm6
-    vcvtdq2ps  ymm7,  ymm7
-    vpermilps  ymm8,  ymm12, 0xAA
-    vpermilps  ymm9,  ymm12, 0xFF
-    vfmadd231ps ymm2, ymm6, ymm8
-    vfmadd231ps ymm3, ymm7, ymm9
+%macro ROW_REDUCE_STORE 0
+    vaddps  xmm0, xmm0, xmm1
+    vaddps  xmm2, xmm2, xmm3
+    vaddps  xmm0, xmm0, xmm2
+    vhaddps xmm0, xmm0, xmm0
+    vhaddps xmm0, xmm0, xmm0
+    vmovss  [rdx], xmm0
+    add     rdx, 4
 %endmacro
 
 ; ----------------------------------------------------------------------------
 ; void matmul_q8_0_range(const void *W, const float *x, float *out,
 ;                        uint64 K, uint64 r0, uint64 r1)
-; FAST_Q8=1: 1-row sequential 4-block (128B) unrolled AVX2 + FMA + F16C
-; INT8xINT8 kernel with monotonic next-row software prefetch.
-;   - Linear row-by-row memory traversal maximizes DRAM/L2 streaming BW
-;   - 4 independent FP32 accumulators saturate Zen2/Haswell FMA & int pipes
-;   - Zero stack accesses inside row/block loops
-;   - 100% bit-for-bit identical per row for ANY partitioning (1T..64T)
+; FAST_Q8=1, Ivy Bridge: 1-row sequential 4-block INT8xINT8 kernel on 128-bit
+; integer SIMD (SSSE3 vpsignb/vpmaddubsw + vpmaddwd), F16C scales, separate
+; multiply and add instead of FMA. Every row is computed by exactly one thread
+; in a fixed order, so results do not depend on the thread count.
 ; ----------------------------------------------------------------------------
 matmul_q8_0_range:
     push    rbx
@@ -277,8 +296,9 @@ matmul_q8_0_range:
     jle     .exit
 
     lea     rdx, [rdx + r8 * 4]         ; rdx = out_ptr = out + r0 * 4
-    vpbroadcastw ymm15, [rel q8_one16]  ; 16x int16(1)
+    vmovdqa xmm15, [rel q8_one16x8]     ; 8x int16(1)
     lea     r11, [rel q8_xq]
+    lea     r10, [rel q8_xa]
     lea     rbp, [rel q8_xs]
     mov     r15, rcx                    ; r15 = K
     mov     r13, rcx
@@ -288,7 +308,7 @@ matmul_q8_0_range:
     jne     .fast_fp16
 
     ; ========================================================================
-    ; FAST_Q8=1, v1 FP32 scales: row_stride = K + (K >> 3)
+    ; v1 FP32 scales: row_stride = K + (K >> 3)
     ; ========================================================================
     mov     r14, rcx
     shr     r14, 3
@@ -301,11 +321,10 @@ align 16
 .row_f32:
     lea     r12, [rax + r14]            ; r12 = w_next
     lea     r8,  [rax + r15]            ; r8  = s_cur (fp32)
-
-    vxorps  ymm0, ymm0, ymm0
-    vxorps  ymm1, ymm1, ymm1
-    vxorps  ymm2, ymm2, ymm2
-    vxorps  ymm3, ymm3, ymm3
+    vxorps  xmm0, xmm0, xmm0
+    vxorps  xmm1, xmm1, xmm1
+    vxorps  xmm2, xmm2, xmm2
+    vxorps  xmm3, xmm3, xmm3
     xor     ebx, ebx                    ; b_q: 0, 128, ...
     xor     r9d, r9d                    ; b_s: 0, 16, ... (fp32 scale & xs offset)
     test    r13, r13
@@ -313,12 +332,9 @@ align 16
 
 align 16
 .blk4_f32:
-    vmovups    xmm12, [r8 + r9]         ; 4x fp32 scale_w
-    vmulps     xmm12, xmm12, [rbp + r9] ; * 4x fp32 scale_x
-    vinsertf128 ymm12, ymm12, xmm12, 1
-
+    vmovups xmm12, [r8 + r9]            ; 4x fp32 scale_w
+    vmulps  xmm12, xmm12, [rbp + r9]    ; * 4x fp32 scale_x
     INT8_1ROW_4BLK
-
     add     rbx, 128
     add     r9, 16
     cmp     rbx, r13
@@ -327,38 +343,22 @@ align 16
 .tail_f32:
     cmp     rbx, r15
     jae     .red_f32
-    vmovdqa    ymm4, [r11 + rbx]
-    vpabsb     ymm5, ymm4
-    vmovdqu    ymm6, [rax + rbx]
-    vpsignb    ymm6, ymm6, ymm4
-    vpmaddubsw ymm6, ymm5, ymm6
-    vpmaddwd   ymm6, ymm6, ymm15
-    vcvtdq2ps  ymm6, ymm6
-    vmovss     xmm8, [r8 + r9]
-    vmulss     xmm8, xmm8, [rbp + r9]
-    vbroadcastss ymm8, xmm8
-    vfmadd231ps ymm0, ymm6, ymm8
+    vmovss  xmm12, [r8 + r9]
+    vmulss  xmm12, xmm12, [rbp + r9]
+    INT8_BLK_AVX1 0, xmm0, 0x00
     add     rbx, 32
     add     r9, 4
     jmp     .tail_f32
 
 .red_f32:
-    vaddps  ymm0, ymm0, ymm1
-    vaddps  ymm2, ymm2, ymm3
-    vaddps  ymm0, ymm0, ymm2
-    vhaddps ymm0, ymm0, ymm0
-    vhaddps ymm0, ymm0, ymm0
-    vextractf128 xmm1, ymm0, 1
-    vaddss  xmm0, xmm0, xmm1
-    vmovss  [rdx], xmm0
-    add     rdx, 4
+    ROW_REDUCE_STORE
     mov     rax, r12
     dec     rsi
     jnz     .row_f32
     jmp     .exit
 
     ; ========================================================================
-    ; FAST_Q8=1, v2 FP16 scales: row_stride = K + (K >> 4)
+    ; v2 FP16 scales: row_stride = K + (K >> 4)
     ; ========================================================================
 .fast_fp16:
     mov     r14, rcx
@@ -372,11 +372,10 @@ align 16
 .row_f16:
     lea     r12, [rax + r14]            ; r12 = w_next
     lea     r8,  [rax + r15]            ; r8  = s_cur (fp16)
-
-    vxorps  ymm0, ymm0, ymm0
-    vxorps  ymm1, ymm1, ymm1
-    vxorps  ymm2, ymm2, ymm2
-    vxorps  ymm3, ymm3, ymm3
+    vxorps  xmm0, xmm0, xmm0
+    vxorps  xmm1, xmm1, xmm1
+    vxorps  xmm2, xmm2, xmm2
+    vxorps  xmm3, xmm3, xmm3
     xor     ebx, ebx                    ; b_q: 0, 128, ...
     xor     r9d, r9d                    ; b_s: 0, 8, ... (fp16 scale offset; xs = r9*2)
     test    r13, r13
@@ -387,10 +386,7 @@ align 16
     vmovq      xmm12, qword [r8 + r9]   ; 4x fp16 scale_w
     vcvtph2ps  xmm12, xmm12             ; -> 4x fp32
     vmulps     xmm12, xmm12, [rbp + r9*2] ; * 4x fp32 scale_x
-    vinsertf128 ymm12, ymm12, xmm12, 1
-
     INT8_1ROW_4BLK
-
     add     rbx, 128
     add     r9, 8
     cmp     rbx, r13
@@ -399,33 +395,17 @@ align 16
 .tail_f16:
     cmp     rbx, r15
     jae     .red_f16
-    vmovdqa    ymm4, [r11 + rbx]
-    vpabsb     ymm5, ymm4
-    vmovdqu    ymm6, [rax + rbx]
-    vpsignb    ymm6, ymm6, ymm4
-    vpmaddubsw ymm6, ymm5, ymm6
-    vpmaddwd   ymm6, ymm6, ymm15
-    vcvtdq2ps  ymm6, ymm6
-    movzx      ecx, word [r8 + r9]
-    vmovd      xmm8, ecx
-    vcvtph2ps  xmm8, xmm8
-    vmulss     xmm8, xmm8, [rbp + r9*2]
-    vbroadcastss ymm8, xmm8
-    vfmadd231ps ymm0, ymm6, ymm8
+    movzx   ecx, word [r8 + r9]
+    vmovd   xmm12, ecx
+    vcvtph2ps xmm12, xmm12
+    vmulss  xmm12, xmm12, [rbp + r9*2]
+    INT8_BLK_AVX1 0, xmm0, 0x00
     add     rbx, 32
     add     r9, 2
     jmp     .tail_f16
 
 .red_f16:
-    vaddps  ymm0, ymm0, ymm1
-    vaddps  ymm2, ymm2, ymm3
-    vaddps  ymm0, ymm0, ymm2
-    vhaddps ymm0, ymm0, ymm0
-    vhaddps ymm0, ymm0, ymm0
-    vextractf128 xmm1, ymm0, 1
-    vaddss  xmm0, xmm0, xmm1
-    vmovss  [rdx], xmm0
-    add     rdx, 4
+    ROW_REDUCE_STORE
     mov     rax, r12
     dec     rsi
     jnz     .row_f16
@@ -440,272 +420,7 @@ align 16
     ret
 
 %else
-; ----------------------------------------------------------------------------
-; void matmul_q8_0_range(const void *W, const float *x, float *out,
-;                        uint64 K, uint64 r0, uint64 r1)
-; FAST_Q8=0 (legacy): 4-row unrolled AVX2 + FMA Q8_0 x FP32 matmul.
-; Full FP32 activations (zero activation quantization noise).
-; Auto-detects v1 FP32 scales vs v2 FP16 scales via g_fp16_scales.
-; ----------------------------------------------------------------------------
-matmul_q8_0_range:
-    push    rbx
-    push    rbp
-    push    r12
-    push    r13
-    push    r14
-    push    r15
-    sub     rsp, 48
-    ; [rsp + 0]  = out_ptr
-    ; [rsp + 8]  = rows_left (r1 - r0)
-    ; [rsp + 16] = row_stride
-    ; [rsp + 24] = stride4
-    ; [rsp + 32] = base_w_cur
-    ; [rsp + 40] = is_fp16 (0 or 1)
-
-    mov     rax, r9
-    sub     rax, r8                     ; rows_left = r1 - r0
-    jle     .exit
-    mov     [rsp + 8], rax
-
-    mov     ebp, [rel g_fp16_scales]
-    mov     [rsp + 40], rbp
-
-    ; row_stride = K + (K >> (is_fp16 ? 4 : 3))
-    mov     rbx, rcx
-    test    ebp, ebp
-    jnz     .stride_f16
-    shr     rbx, 3
-    jmp     .stride_done
-.stride_f16:
-    shr     rbx, 4
-.stride_done:
-    add     rbx, rcx
-    mov     [rsp + 16], rbx
-    lea     rax, [rbx * 4]
-    mov     [rsp + 24], rax
-
-    lea     rdx, [rdx + r8 * 4]
-    mov     [rsp + 0], rdx
-
-    mov     rax, r8
-    imul    rax, rbx
-    add     rdi, rax
-    mov     [rsp + 32], rdi
-
-    mov     r11, rsi                    ; x_ptr (float*)
-    mov     r15, rcx                    ; K
-
-.row4_lp:
-    cmp     qword [rsp + 8], 4
-    jb      .row1_check
-
-    mov     rax, [rsp + 32]             ; w0
-    mov     rbx, [rsp + 16]             ; row_stride
-    lea     rcx, [rax + rbx]            ; w1
-    lea     rdx, [rcx + rbx]            ; w2
-    lea     rsi, [rdx + rbx]            ; w3
-
-    lea     rdi, [rax + r15]            ; s0
-    lea     r8,  [rcx + r15]            ; s1
-    lea     r9,  [rdx + r15]            ; s2
-    lea     r10, [rsi + r15]            ; s3
-
-    vxorps  ymm0, ymm0, ymm0
-    vxorps  ymm1, ymm1, ymm1
-    vxorps  ymm2, ymm2, ymm2
-    vxorps  ymm3, ymm3, ymm3
-
-    xor     r12d, r12d                  ; b_x = 0, 128, ...
-    xor     r13d, r13d                  ; b_q = 0, 32,  ...
-    xor     r14d, r14d                  ; b_idx = 0, 1, 2, ... (block index)
-    mov     ebp, [rsp + 40]             ; is_fp16
-
-.blk4_lp:
-    vmovups ymm4, [r11 + r12]
-    vmovups ymm5, [r11 + r12 + 32]
-    vmovups ymm6, [r11 + r12 + 64]
-    vmovups ymm7, [r11 + r12 + 96]
-
-    ; --- Interleaved Rows 0 & 1 ---
-    vpmovsxbd ymm8,  qword [rax + r13]
-    vpmovsxbd ymm12, qword [rcx + r13]
-    vcvtdq2ps ymm8,  ymm8
-    vcvtdq2ps ymm12, ymm12
-    vmulps    ymm8,  ymm8,  ymm4
-    vmulps    ymm12, ymm12, ymm4
-
-    vpmovsxbd ymm9,  qword [rax + r13 + 8]
-    vpmovsxbd ymm13, qword [rcx + r13 + 8]
-    vcvtdq2ps ymm9,  ymm9
-    vcvtdq2ps ymm13, ymm13
-    vfmadd231ps ymm8,  ymm9,  ymm5
-    vfmadd231ps ymm12, ymm13, ymm5
-
-    vpmovsxbd ymm10, qword [rax + r13 + 16]
-    vpmovsxbd ymm14, qword [rcx + r13 + 16]
-    vcvtdq2ps ymm10, ymm10
-    vcvtdq2ps ymm14, ymm14
-    vfmadd231ps ymm8,  ymm10, ymm6
-    vfmadd231ps ymm12, ymm14, ymm6
-
-    vpmovsxbd ymm11, qword [rax + r13 + 24]
-    vpmovsxbd ymm15, qword [rcx + r13 + 24]
-    vcvtdq2ps ymm11, ymm11
-    vcvtdq2ps ymm15, ymm15
-    vfmadd231ps ymm8,  ymm11, ymm7
-    vfmadd231ps ymm12, ymm15, ymm7
-
-    test    ebp, ebp
-    jnz     .s01_f16
-    vbroadcastss ymm9,  dword [rdi + r14*4]
-    vbroadcastss ymm13, dword [r8 + r14*4]
-    jmp     .s01_ok
-.s01_f16:
-    movzx   ebx, word [rdi + r14*2]
-    vmovd   xmm9, ebx
-    vcvtph2ps xmm9, xmm9
-    vbroadcastss ymm9, xmm9
-    movzx   ebx, word [r8 + r14*2]
-    vmovd   xmm13, ebx
-    vcvtph2ps xmm13, xmm13
-    vbroadcastss ymm13, xmm13
-.s01_ok:
-    vfmadd231ps ymm0, ymm8,  ymm9
-    vfmadd231ps ymm1, ymm12, ymm13
-
-    ; --- Interleaved Rows 2 & 3 ---
-    vpmovsxbd ymm8,  qword [rdx + r13]
-    vpmovsxbd ymm12, qword [rsi + r13]
-    vcvtdq2ps ymm8,  ymm8
-    vcvtdq2ps ymm12, ymm12
-    vmulps    ymm8,  ymm8,  ymm4
-    vmulps    ymm12, ymm12, ymm4
-
-    vpmovsxbd ymm9,  qword [rdx + r13 + 8]
-    vpmovsxbd ymm13, qword [rsi + r13 + 8]
-    vcvtdq2ps ymm9,  ymm9
-    vcvtdq2ps ymm13, ymm13
-    vfmadd231ps ymm8,  ymm9,  ymm5
-    vfmadd231ps ymm12, ymm13, ymm5
-
-    vpmovsxbd ymm10, qword [rdx + r13 + 16]
-    vpmovsxbd ymm14, qword [rsi + r13 + 16]
-    vcvtdq2ps ymm10, ymm10
-    vcvtdq2ps ymm14, ymm14
-    vfmadd231ps ymm8,  ymm10, ymm6
-    vfmadd231ps ymm12, ymm14, ymm6
-
-    vpmovsxbd ymm11, qword [rdx + r13 + 24]
-    vpmovsxbd ymm15, qword [rsi + r13 + 24]
-    vcvtdq2ps ymm11, ymm11
-    vcvtdq2ps ymm15, ymm15
-    vfmadd231ps ymm8,  ymm11, ymm7
-    vfmadd231ps ymm12, ymm15, ymm7
-
-    test    ebp, ebp
-    jnz     .s23_f16
-    vbroadcastss ymm9,  dword [r9 + r14*4]
-    vbroadcastss ymm13, dword [r10 + r14*4]
-    jmp     .s23_ok
-.s23_f16:
-    movzx   ebx, word [r9 + r14*2]
-    vmovd   xmm9, ebx
-    vcvtph2ps xmm9, xmm9
-    vbroadcastss ymm9, xmm9
-    movzx   ebx, word [r10 + r14*2]
-    vmovd   xmm13, ebx
-    vcvtph2ps xmm13, xmm13
-    vbroadcastss ymm13, xmm13
-.s23_ok:
-    vfmadd231ps ymm2, ymm8,  ymm9
-    vfmadd231ps ymm3, ymm12, ymm13
-
-    add     r12, 128
-    add     r13, 32
-    inc     r14
-    cmp     r13, r15
-    jb      .blk4_lp
-
-    vhaddps ymm0, ymm0, ymm1
-    vhaddps ymm2, ymm2, ymm3
-    vhaddps ymm0, ymm0, ymm2
-    vextractf128 xmm1, ymm0, 1
-    vaddps  xmm0, xmm0, xmm1
-
-    mov     rax, [rsp + 0]
-    vmovups [rax], xmm0
-    add     rax, 16
-    mov     [rsp + 0], rax
-
-    mov     rax, [rsp + 24]
-    add     [rsp + 32], rax
-    sub     qword [rsp + 8], 4
-    jmp     .row4_lp
-
-.row1_check:
-    cmp     qword [rsp + 8], 0
-    je      .exit
-.row1_lp:
-    mov     rax, [rsp + 32]
-    lea     rdi, [rax + r15]
-    vxorps  ymm0, ymm0, ymm0
-    xor     r12d, r12d
-    xor     r13d, r13d
-    xor     r14d, r14d
-    mov     ebp, [rsp + 40]
-.blk1_lp:
-    vpmovsxbd ymm8,  qword [rax + r13]
-    vpmovsxbd ymm9,  qword [rax + r13 + 8]
-    vpmovsxbd ymm10, qword [rax + r13 + 16]
-    vpmovsxbd ymm11, qword [rax + r13 + 24]
-    vcvtdq2ps ymm8,  ymm8
-    vcvtdq2ps ymm9,  ymm9
-    vcvtdq2ps ymm10, ymm10
-    vcvtdq2ps ymm11, ymm11
-    vmulps    ymm8,  ymm8,  [r11 + r12]
-    vfmadd231ps ymm8, ymm9,  [r11 + r12 + 32]
-    vfmadd231ps ymm8, ymm10, [r11 + r12 + 64]
-    vfmadd231ps ymm8, ymm11, [r11 + r12 + 96]
-    test    ebp, ebp
-    jnz     .s1_f16
-    vbroadcastss ymm12, dword [rdi + r14*4]
-    jmp     .s1_ok
-.s1_f16:
-    movzx   ebx, word [rdi + r14*2]
-    vmovd   xmm12, ebx
-    vcvtph2ps xmm12, xmm12
-    vbroadcastss ymm12, xmm12
-.s1_ok:
-    vfmadd231ps ymm0, ymm8, ymm12
-
-    add     r12, 128
-    add     r13, 32
-    inc     r14
-    cmp     r13, r15
-    jb      .blk1_lp
-
-    vhaddps ymm0, ymm0, ymm0
-    vhaddps ymm0, ymm0, ymm0
-    vextractf128 xmm1, ymm0, 1
-    vaddss  xmm0, xmm0, xmm1
-    mov     rax, [rsp + 0]
-    vmovss  [rax], xmm0
-    add     rax, 4
-    mov     [rsp + 0], rax
-    mov     rax, [rsp + 16]
-    add     [rsp + 32], rax
-    dec     qword [rsp + 8]
-    jnz     .row1_lp
-
-.exit:
-    add     rsp, 48
-    pop     r15
-    pop     r14
-    pop     r13
-    pop     r12
-    pop     rbp
-    pop     rbx
-    ret
+%error "FAST_Q8=0 (FP32-activation path) is not ported to AVX1 / Ivy Bridge; build with FAST_Q8=1"
 %endif
 
 ; ----------------------------------------------------------------------------
@@ -726,10 +441,14 @@ dot_f32_avx2:
     vmovups ymm5, [rdi + rax + 32]
     vmovups ymm6, [rdi + rax + 64]
     vmovups ymm7, [rdi + rax + 96]
-    vfmadd231ps ymm0, ymm4, [rsi + rax]
-    vfmadd231ps ymm1, ymm5, [rsi + rax + 32]
-    vfmadd231ps ymm2, ymm6, [rsi + rax + 64]
-    vfmadd231ps ymm3, ymm7, [rsi + rax + 96]
+    vmulps  ymm4, ymm4, [rsi + rax]
+    vmulps  ymm5, ymm5, [rsi + rax + 32]
+    vmulps  ymm6, ymm6, [rsi + rax + 64]
+    vmulps  ymm7, ymm7, [rsi + rax + 96]
+    vaddps  ymm0, ymm0, ymm4
+    vaddps  ymm1, ymm1, ymm5
+    vaddps  ymm2, ymm2, ymm6
+    vaddps  ymm3, ymm3, ymm7
     add     rax, 128
     jmp     .lp
 .red:
@@ -748,20 +467,21 @@ dot_f32_avx2:
 ; dst[i] += alpha * src[i]
 ; ----------------------------------------------------------------------------
 saxpy_f32_avx2:
-    vbroadcastss ymm0, xmm0
+    vshufps xmm0, xmm0, xmm0, 0
+    vinsertf128 ymm0, ymm0, xmm0, 1
     shl     rdx, 2
     xor     eax, eax
 .lp:
     cmp     rax, rdx
     jae     .done
-    vmovups ymm1, [rdi + rax]
-    vmovups ymm2, [rdi + rax + 32]
-    vmovups ymm3, [rdi + rax + 64]
-    vmovups ymm4, [rdi + rax + 96]
-    vfmadd231ps ymm1, ymm0, [rsi + rax]
-    vfmadd231ps ymm2, ymm0, [rsi + rax + 32]
-    vfmadd231ps ymm3, ymm0, [rsi + rax + 64]
-    vfmadd231ps ymm4, ymm0, [rsi + rax + 96]
+    vmulps  ymm1, ymm0, [rsi + rax]
+    vmulps  ymm2, ymm0, [rsi + rax + 32]
+    vmulps  ymm3, ymm0, [rsi + rax + 64]
+    vmulps  ymm4, ymm0, [rsi + rax + 96]
+    vaddps  ymm1, ymm1, [rdi + rax]
+    vaddps  ymm2, ymm2, [rdi + rax + 32]
+    vaddps  ymm3, ymm3, [rdi + rax + 64]
+    vaddps  ymm4, ymm4, [rdi + rax + 96]
     vmovups [rdi + rax], ymm1
     vmovups [rdi + rax + 32], ymm2
     vmovups [rdi + rax + 64], ymm3
@@ -774,12 +494,11 @@ saxpy_f32_avx2:
 %if FAST_Q8
 section .rodata
 align 32
-q8_pack_perm: dd 0, 4, 1, 5, 2, 6, 3, 7
+q8_one16x8:   times 8 dw 1
+q8_min_i8x16: times 16 db -127
 q8_abs_mask:  dd 0x7FFFFFFF
 q8_f127:      dd 127.0
 q8_inv_127:   dd 0.007874015748031496       ; 1.0f / 127.0f
-q8_one16:     dw 1
-q8_min_i8:    db -127
 %endif
 
 section .bss
@@ -788,6 +507,8 @@ g_fp16_scales: resd 1
 %if FAST_Q8
 alignb 64
 q8_xq:        resb Q8_MAX_K
+alignb 64
+q8_xa:        resb Q8_MAX_K
 alignb 64
 q8_xs:        resb (Q8_MAX_K / 32) * 4
 %endif

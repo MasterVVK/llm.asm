@@ -1,5 +1,9 @@
 # llm.asm
 
+> **Ivy Bridge port (AVX + F16C, no AVX2/FMA)**: [English](ivybridge/README.md) · [Русский](ivybridge/README.ru.md) · [简体中文](ivybridge/README.zh-CN.md)
+>
+> This fork runs llm.asm on CPUs without AVX2/FMA, such as Xeon E5 v2. · Этот форк запускает llm.asm на процессорах без AVX2/FMA, например Xeon E5 v2. · 本分支让 llm.asm 可在不支持 AVX2/FMA 的处理器（如至强 E5 v2）上运行。
+
 **Three complete LLM projects written in 100% pure x86-64 NASM assembly.**
 Zero C, zero C++, zero Rust, zero libc, zero libm, zero runtime dependencies.
 

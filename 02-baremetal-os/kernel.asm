@@ -1293,7 +1293,7 @@ d_1e9:          dq 1000000000.0
 ban_line:       db "==============================================================================", 10, 0
 ban_title:      db "  asm-llm OS v2.0 | Bare-Metal Qwen3-0.6B in 100% Pure x86-64 Assembly", 10, 0
 ban_cpu:        db "  CPU   : ", 0
-ban_avx_tsc:    db " (AVX2+FMA, ", 0
+ban_avx_tsc:    db " (AVX+F16C, ", 0
 ban_mhz_nl:     db " MHz)", 10, 0
 ban_smp:        db "  SMP   : ", 0
 ban_smp_tail:   db " x86-64 cores online (APIC INIT-SIPI-SIPI, lock-free)", 10, 0
@@ -1358,7 +1358,7 @@ key_topp:         db "topp", 0
 key_seed:         db "seed", 0
 key_single_turn:  db "single_turn", 0
 
-msg_err_avx2:   db "[FATAL] CPU lacks AVX2+FMA+XSAVE (use QEMU -cpu host)", 10, 0
+msg_err_avx2:   db "[FATAL] CPU lacks AVX+F16C+XSAVE (use QEMU -cpu host)", 10, 0
 msg_err_mb:     db "[FATAL] Invalid Multiboot 1 magic", 10, 0
 msg_err_mod:    db "[FATAL] Missing .asmbin Multiboot module (pass -initrd model.asmbin)", 10, 0
 msg_err_magic:  db "[FATAL] Invalid .asmbin magic (expected ASML)", 10, 0

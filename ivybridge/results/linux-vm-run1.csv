@@ -1,0 +1,15 @@
+engine,threads,prefill_tok_s,decode_tok_s,runs
+asm-llm-ivb,1,14.49,10.94,3
+llama.cpp,1,20.86,8.05,3
+asm-llm-ivb,2,27.16,20.33,3
+llama.cpp,2,39.57,15.04,3
+asm-llm-ivb,4,44.29,33.91,3
+llama.cpp,4,73.02,25.97,3
+asm-llm-ivb,8,61.53,49.85,3
+llama.cpp,8,143.35,40.01,3
+asm-llm-ivb,12,67.00,53.59,3
+llama.cpp,12,193.08,40.57,3
+asm-llm-ivb,16,68.71,54.41,3
+llama.cpp,16,223.25,40.92,3
+asm-llm-ivb,24,63.12,49.45,3
+llama.cpp,24,249.49,32.17,3

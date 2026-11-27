@@ -1,0 +1,71 @@
+# llm.asm на Ivy Bridge (AVX + F16C, без AVX2/FMA)
+
+[English](README.md) · **Русский** · [简体中文](README.zh-CN.md)
+
+Порт [alesha-pro/llm.asm](https://github.com/alesha-pro/llm.asm) (коммит upstream `48feccb`) на процессоры x86-64 без AVX2 и FMA. Нужны только AVX и F16C, поэтому он работает на Intel Ivy Bridge (2012) и новее. Сюда входят и серверы на Xeon E5 v2, которые до сих пор часто стоят в домашних лабораториях и кластерах Proxmox. Оригиналу нужны AVX2 + FMA (Haswell и новее), и на таких машинах он завершается с `Illegal instruction` (Linux) или `[FATAL] CPU lacks AVX2+FMA` (загрузочная ОС).
+
+Перенесены обе программы: движок для Linux (`build/asm-llm`, 15 344 байта) и загрузочная ОС без Linux (`build/asm-llm-os.elf`, 24 888 байт).
+
+## Что изменено
+
+- `shared/matmul.asm`: ядро INT8×INT8 (`FAST_Q8=1`) работает на 128-битных целочисленных инструкциях (`vpsignb`, `vpmaddubsw`, `vpmaddwd`). Каждый 32-байтный блок обрабатывается двумя половинами по 16 байт. Их суммы int32 складываются точно, и только потом выполняется одно преобразование во float. |x| вектора активаций считается один раз на всё умножение, а не на каждую строку весов. FMA заменены на `vmulps` + `vaddps`. Упаковка int32→int8 и распаковка эмбеддинга выполняются на половинах по 128 бит.
+- `shared/math.asm`: FMA заменены на умножение и сложение (макросы `MADD213SD` / `MADD213PS`). 2^k в `expf` собирается на 128-битных половинах. `argmax` хранит индексы во float. `vbroadcastss` из регистра заменён макросом `BCAST_SS`.
+- `02-baremetal-os/boot.asm`, `kernel.asm`: проверка CPUID требует XSAVE + AVX + F16C, тексты заставки и ошибки обновлены.
+- `FAST_Q8=0` (FP32-активации) не перенесён: его сборка останавливается на `%error`.
+- Проверено дизассемблером: ни в одном бинарнике нет ни одной инструкции AVX2 или FMA и нет старых (не-VEX) инструкций SSE, поэтому нет штрафов за переходы AVX–SSE.
+
+## Корректность
+
+- Оригинальная AVX2-сборка, запущенная в эмуляторе `qemu-x86_64 -cpu max`, и этот порт выдают на эталонном промпте upstream **одинаковые 64 из 64 жадных токенов** и побайтно одинаковый текст. Косинусная близость логитов после промпта — 0,99970: без FMA округления немного другие, и несколько активаций квантуются иначе. Сам upstream относительно своего FP32-эталона даёт 0,99965. Файлы `results/parity-*`.
+- Модульные тесты upstream (`python3 scripts/test_math.py build/test_math`) проходят, все погрешности не выше значений из README upstream.
+- `ivybridge/test_matmul_k.py` проверяет основной цикл по 4 блока на размерах модели; тесты upstream используют K = 64 и доходят только до хвостовой ветки. При K = 1024 / 2048 / 3072 с масштабами FP32 и FP16 максимальная относительная ошибка против точного Q8_0×Q8_0 — от 4e-8 до 1,4e-7. Само квантование активаций вносит около 1e-2.
+- Вывод на 1 и 4 потоках совпадает побитово.
+
+## Результаты
+
+Железо: хост Proxmox VE 8.4 с 2× Xeon E5-2696 v2 (Ivy Bridge-EP, по 12 ядер) и памятью DDR3-1600. Замеры под Linux сделаны в KVM-госте Ubuntu 22.04 на 32 vCPU на этом хосте. Модель: Qwen3-0.6B Q8_0 (`.asmbin` v2 для asm-llm, официальный `Qwen3-0.6B-Q8_0.gguf` для llama.cpp). Промпт 34 токена, генерация 64 токена, как в таблице upstream. llama.cpp: официальный релиз b12810 (`ca123ba76`, CPU-бэкенд `ivybridge`), `llama-bench -ngl 0`, flash attention `auto` (включён; так быстрее, чем выключенный). Диапазоны — по двум сериям из 3 прогонов (`results/linux-vm-run*.csv`), в токенах в секунду:
+
+| Потоки | Генерация: порт | Генерация: llama.cpp | Выигрыш | Промпт: порт | Промпт: llama.cpp |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 10,9 | 7,6–8,1 | +36…44% | 14,5 | 20,9–21,9 |
+| 4 | 33,7–33,9 | 25,7–26,0 | +31% | 44,3–44,6 | 72–73 |
+| 8 | 47,7–49,9 | 39,1–40,0 | +22…25% | 61,5–62,1 | 143–146 |
+| 16 | 51,4–54,4 | 39,9–40,9 | +29…33% | 65–69 | 200–223 |
+| 24 | 49,5 | 32,2 | +54% | 63,1 | 249 |
+
+Загрузочная ОС в бездисковой VM Proxmox на том же хосте (`results/proxmox-os-vm250.txt`): ядро загружается за 170–180 мс, приглашение появляется через 8 с после старта VM. На том же промпте генерация быстрее Linux-сборки на 24% при 1 ядре, на 12% при 4, на 4% при 8 и на 5% при 12 ядрах; при 12 ядрах — 55,4 ток/с.
+
+## Ограничения
+
+- Промпт обрабатывается по одному токену, поэтому в 1,5–4 раза медленнее, чем в llama.cpp. На длинных промптах llama.cpp выигрывает по общему времени.
+- Только Qwen3-0.6B: архитектура зашита в код, контекст до 2048 токенов, нет GPU и сетевого API.
+- **Загрузочная ОС держит все свои vCPU на 100% даже в простое**: рабочие ядра ждут в цикле `pause`, `hlt` нет. На общем гипервизоре включайте её только на время работы.
+- Под Linux не задавайте `-t` больше числа свободных ядер. По умолчанию стоит 32 потока, и на занятой машине скорость падает больше чем на порядок (issues #9 и #10 в upstream).
+- Для FP16-масштабов нужен F16C, поэтому Sandy Bridge (Xeon E5 v1) не поддерживается.
+
+## Как повторить
+
+```bash
+make inference os test-math          # нужны nasm и binutils
+python3 scripts/test_math.py build/test_math
+nasm -f elf64 -DFAST_Q8=1 -Ishared/ ivybridge/test_matmul_k.asm -o build/test_matmul_k.o
+ld --gc-sections -s -z noexecstack build/test_matmul_k.o build/syscalls.o build/matmul.o -o build/test_matmul_k
+python3 ivybridge/test_matmul_k.py build/test_matmul_k
+# выгрузка модели: см. 01-qwen3-inference/README.md
+ivybridge/bench.sh build/asm-llm models/qwen3-0.6b-q8_0.asmbin /path/to/llama-bench /path/to/Qwen3-0.6B-Q8_0.gguf "1 4 8 16" 3 out.csv
+```
+
+Загрузочный ISO: `make os-iso MODEL=models/qwen3-0.6b-q8_0.asmbin` (нужны `grub-pc-bin grub-efi-amd64-bin mtools xorriso`). VM в Proxmox VE без диска и сети:
+
+```bash
+qm create 250 --name asm-llm-os --machine pc --bios seabios --cpu host --cores 8 \
+  --memory 2048 --balloon 0 --vga std --serial0 socket \
+  --sata0 local:iso/asm-llm-os.iso,media=cdrom --boot order=sata0 --ostype other --onboot 0
+qm start 250 && python3 ivybridge/serial_bench.py 250 3; qm stop 250
+```
+
+Подключайте ISO как `sata0`. С `ide2`, как в инструкции upstream, GRUB читает модель на 614 МиБ около 64 с, с `sata0` — около 8 с. `serial_bench.py` запускается на хосте Proxmox: ждёт приглашения `asm-llm>` на последовательном порту VM и выполняет `/bench`.
+
+## Лицензия
+
+MIT, как у upstream. Оригинал © 2026 Alexey Fateev ([alesha-pro/llm.asm](https://github.com/alesha-pro/llm.asm)).
