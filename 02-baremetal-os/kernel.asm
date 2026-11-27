@@ -41,6 +41,7 @@ extern smp_init
 extern tp_shutdown
 extern model_init
 extern transformer_forward
+extern tok_continue_prompt
 extern tok_build_chat_prompt
 extern tok_write_stdout
 extern argmax_f32
@@ -148,9 +149,15 @@ kernel_main:
     sub     r15, r13                    ; r15 = mod_size
     mov     [rel g_mod_size], r15
 
-    ; Verify ASML magic in physical RAM before anything else
-    cmp     dword [r13 + HDR_MAGIC], ASMBIN_MAGIC
+    ; Recognize supported containers here; model_init validates their headers.
+    cmp     r15, 128
+    jb      .err_bad_magic
+    mov     eax, [r13 + HDR_MAGIC]
+    cmp     eax, ASMBIN_MAGIC
+    je      .module_format_ok
+    cmp     eax, ALF2_MAGIC
     jne     .err_bad_magic
+.module_format_ok:
 
     ; 3. Initialize bare-metal physical memory bump allocator
     mov     rdi, r12
@@ -466,6 +473,11 @@ run_inference:
     lea     rsi, [rel msg_ctx_full]
     call    write_cstr
 .ctx_room_ok:
+    mov     rdi, [rbp + CTX_BUF_PROMPT]
+    mov     rsi, r12
+    mov     rdx, [rel g_chat_pos]
+    call    tok_continue_prompt
+    mov     r12, rax
     mov     rax, [rbp + CTX_MAX_SEQ]
     cmp     r12, rax
     jbe     .prompt_len_ok
@@ -589,11 +601,17 @@ run_inference:
     cmp     rax, [rbp + CTX_MAX_SEQ]
     jae     .save_chat_pos
     mov     edi, TOK_IM_END
+    cmp     dword [rbp + CTX_IS_LFM2], 0
+    mov     eax, LFM_IM_END
+    cmovne  edi, eax
     mov     rsi, r13
     xor     edx, edx
     call    transformer_forward
     inc     r13
     mov     edi, TOK_NL
+    cmp     dword [rbp + CTX_IS_LFM2], 0
+    mov     eax, LFM_NL
+    cmovne  edi, eax
     mov     rsi, r13
     xor     edx, edx
     call    transformer_forward
@@ -917,6 +935,9 @@ print_boot_banner:
     call    vga_set_color
     mov     edi, 1
     lea     rsi, [rel ban_qwen]
+    cmp     dword [rel g_ctx + CTX_IS_LFM2], 0
+    lea     rax, [rel ban_lfm2]
+    cmovne  rsi, rax
     call    write_cstr
     mov     rax, [rel g_mod_size]
     add     rax, 524288
@@ -931,6 +952,12 @@ print_boot_banner:
     call    write_hex64_raw
     mov     dil, VGA_ATTR_GREY
     call    vga_set_color
+    mov     edi, 1
+    lea     rsi, [rel ban_mod_layers]
+    call    write_cstr
+    mov     edi, 1
+    mov     rsi, [rel g_ctx + CTX_N_LAYERS]
+    call    write_u64
     mov     edi, 1
     lea     rsi, [rel ban_mod_ctx]
     call    write_cstr
@@ -1301,9 +1328,11 @@ ban_ram:        db "  RAM   : ", 0
 ban_ram_mid:    db " MiB | Arena: ", 0
 ban_boot_lbl:   db " MiB | Boot: ", 0
 ban_model:      db "  Model : ", 0
+ban_lfm2:       db "LFM2-700M Q8_0 (", 0
 ban_qwen:       db "Qwen3-0.6B Q8_0 (", 0
 ban_mod_at:     db " MiB @ 0x", 0
-ban_mod_ctx:    db ", 28L, ctx=", 0
+ban_mod_layers: db ", ", 0
+ban_mod_ctx:    db "L, ctx=", 0
 
 msg_prompt_lbl: db "Prompt: ", 0
 msg_repl_help:  db "Interactive Bare-Metal Chat (/clear, /think, /nothink, /bench, /halt, /help)", 10, 0
@@ -1361,7 +1390,7 @@ key_single_turn:  db "single_turn", 0
 msg_err_avx2:   db "[FATAL] CPU lacks AVX+F16C+XSAVE (use QEMU -cpu host)", 10, 0
 msg_err_mb:     db "[FATAL] Invalid Multiboot 1 magic", 10, 0
 msg_err_mod:    db "[FATAL] Missing .asmbin Multiboot module (pass -initrd model.asmbin)", 10, 0
-msg_err_magic:  db "[FATAL] Invalid .asmbin magic (expected ASML)", 10, 0
+msg_err_magic:  db "[FATAL] Invalid model header (expected ASML or ALF2)", 10, 0
 msg_err_oom:    db "[FATAL] Not enough free physical RAM (use -m 2G)", 10, 0
 msg_err_model:  db "[FATAL] model_init failed (arena OOM or bad header)", 10, 0
 

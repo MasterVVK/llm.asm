@@ -27,6 +27,8 @@ extern sys_mmap_file
 extern sys_mmap_anon
 extern sys_munmap
 
+extern lfm2_validate
+extern lfm2_shortconv_step
 extern init_rope_freqs
 extern compute_rope_cs
 extern rope_apply_avx2
@@ -112,6 +114,20 @@ model_init:
 %endif
 
     ; Verify header magic and version (v1 fp32 scales or v2 fp16 scales)
+    cmp     r14, 128
+    jb      .err_bad_hdr
+    mov     dword [rbx + CTX_IS_LFM2], 0
+    cmp     dword [r15 + HDR_MAGIC], ALF2_MAGIC
+    jne     .qwen_header
+    mov     rdi, r15
+    mov     rsi, r14
+    call    lfm2_validate
+    test    eax, eax
+    jnz     .err_bad_hdr
+    mov     dword [rbx + CTX_IS_LFM2], 1
+    mov     ecx, 1                      ; ALF2 v1 always uses FP16 scales
+    jmp     .store_scale_mode
+.qwen_header:
     cmp     dword [r15 + HDR_MAGIC], ASMBIN_MAGIC
     jne     .err_bad_hdr
     mov     eax, [r15 + HDR_VERSION]
@@ -284,6 +300,10 @@ model_init:
     ALLOC_BUF CTX_BUF_K_CACHE, rax
     ALLOC_BUF CTX_BUF_V_CACHE, rax
 
+    cmp     dword [rbx + CTX_IS_LFM2], 0
+    je      .arena_ready
+    ALLOC_BUF CTX_CONV_CACHE, 16*2*1536*4
+.arena_ready:
     ALIGN64 rbp
     mov     [rbx + CTX_ARENA_SIZE], rbp
 
@@ -303,6 +323,10 @@ model_init:
     dec     edx
     jnz     .reloc_lp
 
+    cmp     dword [rbx + CTX_IS_LFM2], 0
+    je      .no_conv_cache
+    add     [rbx + CTX_CONV_CACHE], rax
+.no_conv_cache:
     ; Precompute exact FP64 RoPE inverse frequencies
     mov     rdi, [rbx + CTX_BUF_INV_FREQ]
     mov     rsi, [rbx + CTX_HEAD_DIM]
@@ -448,6 +472,9 @@ transformer_forward:
     imul    rax, [rbx + CTX_LAYER_STRIDE]
     add     rax, [rbx + CTX_LAYERS_PTR]
 
+    cmp     dword [rbx + CTX_IS_LFM2], 0
+    jne     .descriptor
+    mov     qword [rsp + 128], 0         ; no short convolution
     mov     [rsp + 24], rax             ; in_norm
     mov     rcx, [rbx + CTX_DIM]
     shl     rcx, 2
@@ -509,6 +536,31 @@ transformer_forward:
     ALIGN64 rax
     mov     [rsp + 104], rax            ; down_proj [dim, hidden_dim]
 
+    jmp     .input_norm
+.descriptor:
+    ; Resolve absolute offsets in the validated ALF2 descriptor. Zero taps
+    ; select attention; nonzero taps select a stateful causal convolution.
+    mov     r10, [rbx + CTX_MMAP_BASE]
+%macro RESOLVE 2
+    mov     rcx, [rax + 8*%2]
+    add     rcx, r10
+    mov     [rsp + %1], rcx
+%endmacro
+    RESOLVE 24,1
+    RESOLVE 48,2
+    RESOLVE 32,3
+    RESOLVE 40,4
+    RESOLVE 56,5
+    RESOLVE 80,8
+    RESOLVE 88,10
+    RESOLVE 104,12
+    mov     rcx, [rax + 8*9]
+    test    rcx, rcx
+    jz      .taps_set
+    add     rcx, r10
+.taps_set:
+    mov     [rsp + 128], rcx
+.input_norm:
     ; --- 3a. Input RMSNorm: buf_xb = rmsnorm(buf_x, in_norm) ---
     mov     rdi, [rbx + CTX_BUF_XB]
     mov     rsi, [rbx + CTX_BUF_X]
@@ -517,6 +569,34 @@ transformer_forward:
     vmovss  xmm0, [rbx + CTX_RMS_EPS]
     call    rmsnorm_avx2
 
+    cmp     qword [rsp + 128], 0
+    je      .attention
+    ; Project B,C,x into the FFN scratch (3*dim <= hidden_dim); it is
+    ; consumed before the gate/up projection. Keep per-layer history separate.
+    mov     rdi, [rsp + 56]
+    mov     rsi, [rbx + CTX_BUF_XB]
+    mov     rdx, [rbx + CTX_BUF_GATE]
+    mov     r8,  [rbx + CTX_DIM]
+    lea     rcx, [r8 + r8*2]
+    call    tp_matmul_q8_0
+    mov     r12, [rsp + 16]
+    imul    r12, 2*1536*4
+    add     r12, [rbx + CTX_CONV_CACHE]
+    cmp     qword [rsp], 0
+    jne     .have_history
+    mov     rdi, r12                    ; /clear, new prompt, or context reset
+    xor     eax, eax
+    mov     ecx, 1536
+    rep stosq
+.have_history:
+    mov     rdi, [rbx + CTX_BUF_ATT_OUT]
+    mov     rsi, [rbx + CTX_BUF_GATE]
+    mov     rdx, [rsp + 128]
+    mov     rcx, r12
+    mov     r8,  [rbx + CTX_DIM]
+    call    lfm2_shortconv_step
+    jmp     .att_done
+.attention:
     ; --- 3b. Fused Q + K + V projection in ONE parallel matmul (zero padding between q/k/v!) ---
     mov     rdi, [rsp + 56]             ; q_proj (contiguous with k_proj, v_proj)
     mov     rsi, [rbx + CTX_BUF_XB]

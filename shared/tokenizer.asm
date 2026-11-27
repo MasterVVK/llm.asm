@@ -19,6 +19,7 @@ section .text
 global tok_encode_bpe
 global tok_build_chat_prompt
 global tok_write_stdout
+global tok_continue_prompt
 
 ; ----------------------------------------------------------------------------
 ; uint64 tok_encode_bpe(const uint8 *text, uint64 len, uint32 *out_toks, uint64 max_toks)
@@ -162,6 +163,8 @@ tok_build_chat_prompt:
     mov     rdi, r12
     call    str_len                     ; rax = prompt byte length
 
+    cmp     dword [rel g_ctx + CTX_IS_LFM2], 0
+    jne     .liquid
     test    r15, r15
     jz      .chat_mode
 
@@ -206,6 +209,40 @@ tok_build_chat_prompt:
 
 .ret_cnt:
     mov     rax, rcx
+    jmp     .done
+.liquid:
+    ; The pinned template begins with BOS. For continued conversations
+    ; tok_continue_prompt removes the extra BOS after any context reset decision.
+    cmp     r14, 9
+    jb      .empty
+    mov     dword [r13], LFM_BOS
+    mov     rsi, rax
+    mov     rdi, r12
+    test    r15, r15
+    jz      .liquid_chat
+    lea     rdx, [r13+4]
+    lea     rcx, [r14-1]
+    call    tok_encode_bpe
+    inc     rax
+    jmp     .done
+.liquid_chat:
+    mov     dword [r13+4], LFM_IM_START
+    mov     dword [r13+8], LFM_USER
+    mov     dword [r13+12], LFM_NL
+    lea     rdx, [r13+16]
+    lea     rcx, [r14-9]
+    call    tok_encode_bpe
+    lea     rdx, [r13+rax*4+16]
+    mov     dword [rdx], LFM_IM_END
+    mov     dword [rdx+4], LFM_NL
+    mov     dword [rdx+8], LFM_IM_START
+    mov     dword [rdx+12], LFM_ASSISTANT
+    mov     dword [rdx+16], LFM_NL
+    add     rax, 9
+    jmp     .done
+.empty:
+    xor     ecx, ecx
+    mov     rax, rcx
 .done:
     pop     r15
     pop     r14
@@ -215,6 +252,23 @@ tok_build_chat_prompt:
     ret
 
 ; ----------------------------------------------------------------------------
+; uint64 tok_continue_prompt(uint32 *prompt, uint64 n, uint64 current_pos).
+; Only LFM2 wraps fresh prompts in a BOS. Shift overlapping IDs toward start.
+tok_continue_prompt:
+    mov     rax, rsi
+    test    rdx, rdx
+    jz      .done
+    test    rax, rax
+    jz      .done
+    cmp     dword [rel g_ctx + CTX_IS_LFM2], 0
+    je      .done
+    dec     rax
+    mov     rcx, rax
+    lea     rsi, [rdi+4]
+    rep movsd
+.done:
+    ret
+
 ; void tok_write_stdout(uint32 token_id)
 ; rdi = token_id -> writes raw UTF-8 token bytes directly to stdout (fd=1).
 ; ----------------------------------------------------------------------------

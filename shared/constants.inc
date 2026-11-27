@@ -40,6 +40,7 @@
 
 ; --- .asmbin Header Offsets (128 bytes) ---
 %define ASMBIN_MAGIC        0x4C4D5341  ; "ASML"
+%define ALF2_MAGIC          0x32464C41  ; "ALF2", LFM2 descriptor format
 %define ASMBIN_VERSION      1
 %define ASMBIN_VERSION_V2   2
 %define HDR_FLAG_TIED_EMB   1
@@ -93,6 +94,14 @@
 %define TOK_ASSISTANT       77091
 %define TOK_NL              198
 %define TOK_NL2             271
+
+; --- Fixed LiquidAI/LFM2-700M vocabulary from the pinned tokenizer ---
+%define LFM_BOS             1
+%define LFM_IM_START        6
+%define LFM_IM_END          7
+%define LFM_USER            6423
+%define LFM_ASSISTANT       64015
+%define LFM_NL              708
 
 ; --- Limits ---
 %define MAX_THREADS         64
@@ -154,4 +163,6 @@
 %define CTX_BUF_PROBS       360
 %define CTX_FP16_SCALES     368         ; uint32: 0 = v1 fp32 scales, 1 = v2 fp16 scales
 %define CTX_SCALE_SHIFT     372         ; uint32: 3 = fp32 (K>>3), 4 = fp16 (K>>4)
-%define CTX_SIZE            384
+%define CTX_IS_LFM2         376         ; uint32: descriptor-based hybrid blocks
+%define CTX_CONV_CACHE      384         ; two F32 history planes per layer (LFM2 only)
+%define CTX_SIZE            392

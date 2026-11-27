@@ -28,6 +28,7 @@ extern argmax_f32
 extern sample_top_p
 extern tp_init
 extern tp_shutdown
+extern tok_continue_prompt
 extern tok_build_chat_prompt
 extern tok_write_stdout
 extern model_init
@@ -320,6 +321,8 @@ _start:
     inc     rsi
     jmp     .csv_num
 .csv_sep:
+    cmp     rax, [rbp + CTX_VOCAB_SIZE]
+    jae     .err_prompt
     mov     [rdi + r12*4], eax
     inc     r12
     cmp     byte [rsi], ','
@@ -551,6 +554,11 @@ run_tokens:
     lea     rsi, [rel msg_ctx_full]
     call    write_cstr
 .ctx_room_ok:
+    mov     rdi, [rbp + CTX_BUF_PROMPT]
+    mov     rsi, r12
+    mov     rdx, [rel g_chat_pos]
+    call    tok_continue_prompt
+    mov     r12, rax
     mov     rax, [rbp + CTX_MAX_SEQ]
     cmp     r12, rax
     jbe     .prompt_len_ok
@@ -692,11 +700,17 @@ run_tokens:
     cmp     rax, [rbp + CTX_MAX_SEQ]
     jae     .save_chat_pos
     mov     edi, TOK_IM_END
+    cmp     dword [rbp + CTX_IS_LFM2], 0
+    mov     eax, LFM_IM_END
+    cmovne  edi, eax
     mov     rsi, r13
     xor     edx, edx
     call    transformer_forward
     inc     r13
     mov     edi, TOK_NL
+    cmp     dword [rbp + CTX_IS_LFM2], 0
+    mov     eax, LFM_NL
+    cmovne  edi, eax
     mov     rsi, r13
     xor     edx, edx
     call    transformer_forward
@@ -984,7 +998,7 @@ msg_ctx_full:   db "[chat] context full, resetting KV-cache", 10, 0
 msg_think_on:   db "[mode] think=1", 10, 0
 msg_think_off:  db "[mode] think=0", 10, 0
 msg_err_model:  db "error: failed to load .asmbin model", 10, 0
-msg_err_prompt: db "error: empty prompt", 10, 0
+msg_err_prompt: db "error: empty prompt or invalid token ID", 10, 0
 msg_usage:
     db "asm-llm (pure x86-64 AVX2/FMA Qwen3-0.6B Q8_0, zero libc)", 10
     db "Usage: asm-llm -m <model.asmbin> [options]", 10
