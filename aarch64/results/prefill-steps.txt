@@ -1,0 +1,45 @@
+# Per-token steps of the batched prefill as pool jobs, Qwen3-0.6B Q8_0, CM3588
+# (RK3588), default DDR governor. Residual adds, RMSNorm, activation
+# quantization, QK-norm, RoPE, the KV copy and SwiGLU run with one token
+# (SwiGLU: a quarter of a token) per chunk (aarch64/transformer.s: norm_item,
+# qk_item, silu_item), and attn_pair_item quantizes its outputs for the output
+# projection. Logits are bit-identical to the previous version and to --batch 1
+# on every core set (34-token prompt: 98b4171a162a99e8e69ac21845bd8001, 227-token
+# prompt: 04e94def44b5db53ae0c2a45cd0f75f3), also with the per-token attention
+# path forced.
+
+# Previous version (e8f4622) and this one run alternately, every run started below 65 C.
+# Tokens per second, 3 runs each; --batch 16 (default), taskset per core set.
+cores   prompt  previous              steps_in_pool
+4xA76   34      176.45 177.99 176.06  178.78 190.34 187.19
+4xA76   227     194.10 194.05 193.42  210.80 220.28 210.38
+1xA76   34      54.76 58.22 55.56     57.69 60.55 55.32
+1xA76   227     53.81 53.81 53.78     53.07 53.63 52.98
+4xA55   34      39.32 38.14 39.10     40.19 41.42 40.39
+4xA55   227     39.42 39.02 38.77     41.75 41.98 41.36
+
+# Where the steps go, 227-token prompt, ms per prefill (3 runs, alternating).
+# no steps = norm_item, qk_item and silu_item return at once (their pool jobs
+# still run); the difference to the full build is the work of the steps.
+4xA76  previous version        1163 1164 1120
+4xA76  steps in the pool       1073 1075 1029
+4xA76  no steps                 995  957  960
+1xA76  previous version        4245 4255 4213
+1xA76  steps in the pool       4272 4304 4266
+1xA76  no steps                4125 4185 4198
+4xA55  previous version        5872 5881 5818
+4xA55  steps in the pool       5425 5448 5385
+4xA55  no steps                5040 5078 5050
+# 4xA76: the steps take ~0.11 s, 0.20 s when they ran on one thread; 4xA55:
+# ~0.38 s, 0.82 s before. On four A76 they take about as long as on one A76
+# (~0.09 s), which points to moving token rows between cores: the matmul
+# writes every token row from all cores, and a step reads it whole on one.
+# One A76, second check (4 runs each, ms): steps in the pool 4265 4275 4278 4269,
+# previous 4274 4239 4249 4240; SwiGLU in whole tokens 4262 4276 4280 4235;
+# attention outputs quantized by the matmul as before 4245 4274 4237 4264.
+# The difference stays within 1%.
+
+# Passes of 12 + 12 + 10 tokens (--batch 12) instead of 16 + 16 + 2, 34-token
+# prompt, tokens per second (3 runs each, started below 65 C):
+4xA76   batch16 190.20 196.79 186.29   batch12 209.20 203.85 188.47
+4xA55   batch16 40.75 42.79 43.02      batch12 39.92 40.23 40.13

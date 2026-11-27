@@ -17,7 +17,7 @@
         .global quantize_x_q8_0, matmul_q8_0_range, dequant_row_q8_0
         .global dot_f32, saxpy_f32, q8_xq, q8_xs
         .global repack_q8_0_4x4, matmul_q8_0_4x4_pf, matmul_q8_0_4x4_nopf
-        .global quantize_x_batch, matmul_q8_0_4x4b_pf, matmul_q8_0_4x4b_nopf
+        .global quantize_x_batch, quantize_x_slot, matmul_q8_0_4x4b_pf, matmul_q8_0_4x4b_nopf
         .global g_mm_b, g_mm_m4, g_mm_xstride
 
 // void quantize_x_q8_0(const float *x x0, uint64 K x1)
@@ -518,6 +518,22 @@ quantize_x_batch:
         ldp     x19, x20, [sp, #16]
         ldp     x29, x30, [sp], #64
         ret
+
+// void quantize_x_slot(const float *x x0, uint64 n x1, uint64 t x2, uint64 k0 x3)
+// Quantizes x[0..n) into elements k0 .. k0 + n - 1 of the q8b slot of token t
+// (k0 and n multiples of 32). Blocks are independent, so a token quantized in
+// parts gets the same bytes as quantize_x_batch. Clobbers x0-x6, SIMD.
+quantize_x_slot:
+        mov     x4, #XQ_STRIDE
+        ADR_L   x5, q8b_xq
+        madd    x5, x2, x4, x5
+        add     x5, x5, x3              // int8 of element k0
+        mov     x4, #XS_STRIDE
+        ADR_L   x6, q8b_xs
+        madd    x6, x2, x4, x6
+        add     x3, x6, x3, lsr #3      // scale of block k0 / 32
+        mov     x2, x5
+        b       quantize_core
 
 // void dequant_row_q8_0(const void *row x0, float *out x1, uint64 K x2)
 dequant_row_q8_0:

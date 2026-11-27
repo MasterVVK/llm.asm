@@ -23,7 +23,7 @@
         .global tp_init, tp_matmul, tp_attn, tp_n_threads, g_mm_delta, tp_n_little, tp_chunk_shift
         .global tp_matmul_batch, tp_main_variant
         .global tp_kv_base, tp_pos, tp_scale, tp_gqa
-        .global tp_attn_batch, tp_ab_b
+        .global tp_for, tp_ab_b
 
 // void tp_init(uint64 n x0) — spawns n-1 workers (n clamped to [1, MAX_THREADS])
 // n = 0 picks the thread count automatically: one per big core of the
@@ -259,8 +259,9 @@ tp_run_chunks:
 2:      mov     x0, x2                  // attention head
         bl      gqa_attn_head
         b       1b
-7:      mov     x0, x2                  // two heads of one token of the batch
-        bl      attn_pair_item
+7:      mov     x0, x2                  // item job: fn(i), fn in JOB_W
+        ldr     x9, [x19, #JOB_W]
+        blr     x9
         b       1b
 9:      ldr     x21, [sp, #32]
         ldp     x19, x20, [sp, #16]
@@ -363,6 +364,8 @@ tp_matmul:
 // void tp_matmul_batch(const void *W x0, const float *X x1, float *OUT x2,
 //                      uint64 M x3, uint64 K x4, uint64 B x5)
 // Batched prefill GEMM on the repacked weights; X token stride in g_mm_xstride.
+// X = NULL: the activations are already in the q8b slots (quantized by the
+// pool jobs of transformer_forward_batch).
 tp_matmul_batch:
         stp     x29, x30, [sp, #-64]!
         stp     x19, x20, [sp, #16]
@@ -373,13 +376,14 @@ tp_matmul_batch:
         mov     x21, x3
         mov     x22, x4
         mov     x23, x5
+        cbz     x1, 7f
         mov     x0, x1
         mov     x1, x4
         mov     x2, x5
         ADR_L   x3, g_mm_xstride
         ldr     x3, [x3]
         bl      quantize_x_batch
-        ADR_L   x0, g_mm_b
+7:      ADR_L   x0, g_mm_b
         str     x23, [x0]
         lsl     x1, x21, #2
         ADR_L   x0, g_mm_m4
@@ -453,30 +457,35 @@ tp_attn:
         ldp     x29, x30, [sp], #32
         ret
 
-// void tp_attn_batch(uint64 n_items x0) — batched prefill attention:
-// attn_pair_item(i) for every i < n_items, claimed dynamically by the pool.
-tp_attn_batch:
-        stp     x29, x30, [sp, #-32]!
+// void tp_for(void (*fn)(uint64) x0, uint64 n x1) — fn(i) for every i < n,
+// claimed dynamically by the pool; fn keeps x19-x28 like any AAPCS64 callee.
+// Used by the batched prefill for the attention items and per-token steps.
+tp_for:
+        stp     x29, x30, [sp, #-48]!
         stp     x19, x20, [sp, #16]
+        str     x21, [sp, #32]
         mov     x19, x0
+        mov     x20, x1
         ADR_L   x0, tp_n_threads
         ldr     x0, [x0]
         cmp     x0, #1
         b.gt    2f
-        mov     x20, #0
-1:      cmp     x20, x19
+        mov     x21, #0
+1:      cmp     x21, x20
         b.hs    3f
-        mov     x0, x20
-        bl      attn_pair_item
-        add     x20, x20, #1
+        mov     x0, x21
+        blr     x19
+        add     x21, x21, #1
         b       1b
 2:      ADR_L   x0, tp_job
         mov     w1, #4
         str     w1, [x0, #JOB_KIND]
-        str     w19, [x0, #JOB_NCHUNKS]
+        str     w20, [x0, #JOB_NCHUNKS]
+        str     x19, [x0, #JOB_W]
         bl      tp_dispatch
-3:      ldp     x19, x20, [sp, #16]
-        ldp     x29, x30, [sp], #32
+3:      ldr     x21, [sp, #32]
+        ldp     x19, x20, [sp, #16]
+        ldp     x29, x30, [sp], #48
         ret
 
         .bss
