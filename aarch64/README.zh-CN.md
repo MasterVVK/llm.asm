@@ -1,0 +1,60 @@
+# llm.asm 的 AArch64 移植版（Cortex-A76 / Cortex-A55）
+
+[English](README.md) · [Русский](README.ru.md) · **简体中文**
+
+本项目用 GNU `as` 和 `ld` 从零编写，把 [llm.asm](https://github.com/alesha-pro/llm.asm) 的 Linux 推理引擎（Qwen3-0.6B Q8_0）移植到 AArch64 汇编：不使用 C，不依赖 libc，生成 12 KB 的静态 ELF（`build/asm-llm-arm64`）。模型文件（`.asmbin` v2）、对话模板、分词器和输出格式与 x86-64 版本相同。
+
+## 与 x86-64 代码的区别
+
+- `sdot`（ARMv8.2 点积指令）直接对有符号字节做乘法，不再需要 x86 版本中的符号技巧。
+- 加载时对权重重新排布：每 4 行按 4 字节一组交错存放，思路与 llama.cpp 的 `q8_0_4x4` 相同。这样一条按元素的 `sdot` 就能同时计算 4 行，x 每 4 行只加载一次。重排后的副本保持文件中的偏移不变。`--norepack` 切换为普通的按行内核。
+- 内核有两个版本：Cortex-A76 使用带软件预取的版本，Cortex-A55 使用不带预取的版本——对这种顺序执行的核心，预取会损失约 35% 的性能。每个线程固定在 `taskset` 掩码中的一个 CPU 上，并读取 `MIDR_EL1` 选择版本。负责全部串行工作的主线程总是放在大核上。
+- 动态分配工作：线程用 LSE `ldadd` 领取 16 行一块的任务，快的核心领得更多。结果与哪个线程计算哪一行无关。
+- 线程通过 `ldaxr` + `wfe` 等待。
+- 重排后的权重默认放在 2 MiB 透明大页上（`madvise`）；`--nohugepages` 可关闭。
+- 未移植：交互式对话、采样（只支持贪心解码）、裸机操作系统和 `FAST_Q8=0`。
+
+## 正确性
+
+- 在 1×A76、4×A76、1×A55、4×A55 和全部 8 个核心上，logits 和输出文本逐位一致。
+- 与 x86-64 版本相比，预填充后 logits 的余弦相似度为 0.99971。两个 x86-64 版本彼此之间也相差同样的量级（0.99970）。64 个贪心解码 token 中前 15 个与 x86-64 输出一致，之后出现近似平局：该步有四个候选彼此相差不到 0.23。
+
+## 测试结果
+
+开发板：FriendlyElec CM3588 Plus（RK3588：4× Cortex-A76 2.3 GHz + 4× Cortex-A55 1.8 GHz，32 GB LPDDR4X），Debian 12，内核 6.1。模型 Qwen3-0.6B Q8_0，提示词 34 个 token，生成 64 个 token，测 3 次。llama.cpp b12810 在板上本机编译（`-mcpu=cortex-a76.cortex-a55`、dotprod、OpenMP），用 `llama-bench` 测量。用 `taskset` 选择核心：cpu0–3 为 A55，cpu4–7 为 A76。
+
+生成速度（token/秒），分别为开发板默认的 DDR 调频策略（`dmc_ondemand`）和 DDR 固定在 2400 MHz 时的结果（`results/*.csv`）：
+
+| 核心 | 本移植版，默认 | llama.cpp，默认 | 本移植版，DDR 固定 | llama.cpp，DDR 固定 |
+|---|---:|---:|---:|---:|
+| 1×A76 | 19.7 | 23.0 | 19.6 | 22.7 |
+| 2×A76 | 28.0 | 31.5 | 28.1 | 31.6 |
+| 4×A76 | **34.3** | 30.5 | **32.7** | 30.7 |
+| 1×A55 | 3.0 | 4.8 | 4.5 | 5.7 |
+| 2×A55 | 3.5 | 9.7 | 6.2 | 10.0 |
+| 4×A55 | 10.3 | 16.0 | 11.0 | 16.1 |
+| 全部 8 个 | 28.6 | 19.6 | 28.8 | 22.1 |
+
+DDR 固定时的预填充速度（token/秒）：本移植版在 1 / 2 / 4 个 A76 上为 26.8 / 37.8 / 44.6，在 1 / 2 / 4 个 A55 上为 6.1 / 8.5 / 14.8，全部 8 个核心为 35.5；llama.cpp 分别为 64.4 / 125.8 / 227.7、14.3 / 28.5 / 56.0 和 156.8。
+
+## 结论
+
+- **大核。** 在 1–2 个 A76 上 llama.cpp 快 12–16%；在 4 个 A76 上本移植版快 7–12%：此时瓶颈是内存带宽，较低的同步开销开始发挥作用。4 个 A76 上的 34 token/秒是这块开发板上的最佳成绩。
+- **小核。** DDR 固定时，llama.cpp 在 A55 上快 1.3–1.6 倍。
+- **内存频率。** 在默认调频策略下，只有 A55 工作时内存停留在 534 MHz；只要有一个 A76 工作，内存就升到 2400 MHz。因此默认情况下只用 A55 的任务内存带宽不足：固定 DDR 后，本移植版在单个 A55 上提速 49%。
+- **大小核混用。** 在 4 个 A76 之外再加上 A55，两个引擎都会变慢，因为内存带宽已经饱和。请使用 4 个大核：在允许使用全部核心时，`-t 4` 会自动选择 A76。
+- **预填充**比 llama.cpp 慢 2.3–5 倍，因为本引擎逐个 token 处理提示词。
+
+## 构建与运行
+
+```bash
+aarch64/build.sh                     # 在 AArch64 Linux 机器上（GNU as + ld）
+taskset -c 4-7 build/asm-llm-arm64 -m models/qwen3-0.6b-q8_0.asmbin -p "..." -n 64 -t 4
+aarch64/bench_cores.sh build/asm-llm-arm64 <model.asmbin> <llama-bench> <model.gguf> 3 out.csv
+```
+
+模型文件与 x86-64 版本相同，都是 `.asmbin` v2（`scripts/export_weights.py --scale-dtype fp16`）。
+
+## 许可证
+
+MIT，与上游相同。原始作品 © 2026 Alexey Fateev（[alesha-pro/llm.asm](https://github.com/alesha-pro/llm.asm)）。
