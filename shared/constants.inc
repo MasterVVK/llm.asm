@@ -168,4 +168,5 @@
 %define CTX_BUF_BGU         408         ; [MAX_BATCH][2 * hidden_dim]
 %define CTX_BUF_BCOS        416         ; [MAX_BATCH][head_dim / 2]
 %define CTX_BUF_BSIN        424         ; [MAX_BATCH][head_dim / 2]
+%define CTX_BUF_BSCR        432         ; [MAX_BATCH][n_heads][max_seq] attention scores
 %define CTX_SIZE            448

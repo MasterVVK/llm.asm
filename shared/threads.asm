@@ -34,6 +34,7 @@ extern g_mm_b
 extern g_mm_m4
 extern g_mm_xstride
 extern gqa_attn_range
+extern attn_pair_item
 %endif
 
 section .text
@@ -44,6 +45,7 @@ global tp_matmul_q8_0
 %if FAST_Q8
 global tp_gqa_attn
 global tp_matmul_batch
+global tp_attn_batch
 %endif
 
 ; ----------------------------------------------------------------------------
@@ -263,7 +265,8 @@ tp_init:
 %if FAST_Q8
 ; ----------------------------------------------------------------------------
 ; tp_run_chunks: claim chunks of the published job with LOCK XADD until none
-; remain. Matmul jobs: 2^tp_chunk_shift rows per chunk; attention: one head.
+; remain. Matmul jobs: 2^tp_chunk_shift rows per chunk; attention: one head
+; (tp_mode 2: two heads of one token of the batch).
 ; ----------------------------------------------------------------------------
 tp_run_chunks:
     push    rbx
@@ -298,11 +301,17 @@ tp_run_chunks:
     mov     rcx, rax                    ; h0
     cmp     rcx, [rel tp_M]
     jae     .rc_done
+    cmp     dword [rel tp_mode], 2
+    je      .rc_pair
     lea     r8, [rcx + 1]               ; h1
     mov     rdi, [rel tp_W]
     mov     rsi, [rel tp_x]
     mov     rdx, [rel tp_out]
     call    gqa_attn_range
+    jmp     .rc_lp
+.rc_pair:
+    mov     rdi, rcx
+    call    attn_pair_item
     jmp     .rc_lp
 .rc_done:
     pop     rbx
@@ -529,6 +538,7 @@ tp_gqa_attn:
     mov     [rel tp_out], rdx
     mov     [rel tp_M], rcx
     mov     qword [rel tp_K], 0         ; K == 0 -> gqa_attn_range job
+    mov     dword [rel tp_mode], 0
     mov     dword [rel tp_next], 0
 
     mov     r12d, 1
@@ -551,6 +561,56 @@ tp_gqa_attn:
     mov     r8, rcx                     ; h1 = n_heads
     xor     ecx, ecx                    ; h0 = 0
     jmp     gqa_attn_range
+
+; ----------------------------------------------------------------------------
+; void tp_attn_batch(uint64 n_items)
+; Batched prefill attention: attn_pair_item(i) for every i < n_items, claimed
+; dynamically by the pool (parameters in ab_* of transformer.asm).
+; ----------------------------------------------------------------------------
+tp_attn_batch:
+    push    rbx
+    push    r12
+    sub     rsp, 8
+    mov     rax, [rel tp_n_threads]
+    cmp     rax, 1
+    jle     .ab_single
+    mov     rbx, rax
+    mov     [rel tp_M], rdi
+    mov     qword [rel tp_K], 0         ; attention job ...
+    mov     dword [rel tp_mode], 2      ; ... of the batched kind
+    mov     dword [rel tp_next], 0
+
+    mov     r12d, 1
+    lock xadd dword [rel tp_gen], r12d
+    inc     r12d
+
+    cmp     dword [rel tp_waiters], 0
+    je      tp_matmul_q8_0.run_main_slice
+    lea     rdi, [rel tp_gen]
+    mov     esi, FUTEX_WAKE_PRIVATE
+    mov     edx, FUTEX_WAKE_ALL
+    xor     r10d, r10d
+    xor     r8d, r8d
+    xor     r9d, r9d
+    mov     eax, SYS_futex
+    syscall
+    jmp     tp_matmul_q8_0.run_main_slice
+
+.ab_single:
+    mov     rbx, rdi
+    xor     r12d, r12d
+.ab_lp:
+    cmp     r12, rbx
+    jae     .ab_done
+    mov     rdi, r12
+    call    attn_pair_item
+    inc     r12
+    jmp     .ab_lp
+.ab_done:
+    add     rsp, 8
+    pop     r12
+    pop     rbx
+    ret
 %endif
 
 section .bss
@@ -563,7 +623,7 @@ tp_x:         resq 1
 tp_out:       resq 1
 tp_M:         resq 1
 tp_K:         resq 1
-tp_mode:      resd 1                    ; 0 = GEMV, 1 = batched prefill GEMM
+tp_mode:      resd 1                    ; 0 = GEMV, 1 = batched GEMM, 2 = batched attention
 tp_chunk_shift: resd 1                  ; log2(rows per claimed chunk)
 
 alignb 64

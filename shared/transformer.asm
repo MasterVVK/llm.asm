@@ -45,6 +45,7 @@ extern tp_matmul_q8_0
 extern tp_gqa_attn
 %ifndef BARE_METAL
 extern tp_matmul_batch
+extern tp_attn_batch
 extern g_mm_xstride
 %endif
 %endif
@@ -60,6 +61,7 @@ global transformer_forward
 global gqa_attn_range
 %ifndef BARE_METAL
 global transformer_forward_batch
+global attn_pair_item
 %endif
 %endif
 
@@ -321,6 +323,13 @@ model_init:
     imul    rax, rax, MAX_BATCH
     ALLOC_BUF CTX_BUF_BCOS, rax
     ALLOC_BUF CTX_BUF_BSIN, rax
+%ifndef BARE_METAL
+    mov     rax, [rbx + CTX_N_HEADS]
+    imul    rax, [rbx + CTX_MAX_SEQ]
+    shl     rax, 2                      ; scores of every head of every token
+    imul    rax, rax, MAX_BATCH
+    ALLOC_BUF CTX_BUF_BSCR, rax
+%endif
 
     ALIGN64 rbp
     mov     [rbx + CTX_ARENA_SIZE], rbp
@@ -340,8 +349,12 @@ model_init:
     add     rcx, 8
     dec     edx
     jnz     .reloc_lp
-    lea     rcx, [rbx + CTX_BUF_BX]     ; and the 7 batched prefill buffers
+    lea     rcx, [rbx + CTX_BUF_BX]     ; and the batched prefill buffers
+%ifdef BARE_METAL
     mov     edx, 7
+%else
+    mov     edx, 8
+%endif
 .reloc2_lp:
     add     [rcx], rax
     add     rcx, 8
@@ -1062,12 +1075,207 @@ gqa_attn_range:
 %if FAST_Q8
 %ifndef BARE_METAL
 ; ----------------------------------------------------------------------------
+; void attn_pair_item(uint64 item)
+; One chunk of the batched prefill attention: query heads h and h + 1 of token
+; b, with h = 2 * (item / ab_b) and b = ab_b - 1 - item % ab_b. Consecutive
+; chunks share a kv head, so its K/V rows stay in the core's L2 from token to
+; token, and the longest rows of each pair go first. Both heads read kv head
+; h / gqa (gqa is even) and head_dim is 128.
+; Scores: one K load serves both heads. Values: 2 heads x 32 outputs stay in
+; registers over all positions instead of a load and a store of the output
+; per position. Every float operation matches gqa_attn_range (dot_f32_avx2,
+; softmax_avx2, saxpy_f32_avx2) lane for lane, so scores, weights and outputs
+; are bit-identical.
+; ----------------------------------------------------------------------------
+%define AP_VBASE 0
+%define AP_OUT   8
+
+; score chunk c (8 floats at byte 32c) into accumulators a (head h), b (h + 1)
+%macro AP_SC 3
+    vmovups ymm8, [rax + 32*%1]
+    vmulps  ymm9, ymm8, [r13 + 32*%1]
+    vmulps  ymm10, ymm8, [r13 + 512 + 32*%1]
+    vaddps  ymm%2, ymm%2, ymm9
+    vaddps  ymm%3, ymm%3, ymm10
+%endmacro
+
+; value chunk j (8 floats at byte 32j of the d-block) times weights ymm8, ymm9
+%macro AP_VC 3
+    vmovups ymm10, [rax + 32*%1]
+    vmulps  ymm11, ymm10, ymm8
+    vmulps  ymm12, ymm10, ymm9
+    vaddps  ymm%2, ymm%2, ymm11
+    vaddps  ymm%3, ymm%3, ymm12
+%endmacro
+
+attn_pair_item:
+    push    rbx
+    push    rbp
+    push    r12
+    push    r13
+    push    r14
+    push    r15
+    sub     rsp, 24                     ; 6 pushes + 24 + ret = 80 (16B aligned)
+    lea     rbx, [rel g_ctx]
+    mov     rax, rdi
+    xor     edx, edx
+    div     qword [rel ab_b]            ; rax = head pair, rdx = rank of the token
+    mov     r8, [rel ab_b]
+    dec     r8
+    sub     r8, rdx                     ; r8 = token b
+    lea     r9, [rax + rax]             ; r9 = h
+    mov     r12, [rel ab_pos0]
+    lea     r12, [r12 + r8 + 1]         ; r12 = n = pos0 + b + 1 positions
+    mov     rax, [rbx + CTX_KV_DIM]
+    add     rax, rax
+    add     rax, [rbx + CTX_Q_DIM]      ; q_dim + 2 * kv_dim floats per token
+    imul    rax, r8
+    shl     rax, 2
+    add     rax, [rbx + CTX_BUF_BQKV]
+    mov     rcx, r9
+    shl     rcx, 9                      ; h * 512 bytes
+    lea     r13, [rax + rcx]            ; r13 = q of head h (h + 1 at +512)
+    mov     rax, [rbx + CTX_Q_DIM]
+    imul    rax, r8
+    shl     rax, 2
+    add     rax, [rbx + CTX_BUF_BATT]
+    add     rax, rcx
+    mov     [rsp + AP_OUT], rax         ; output of head h (h + 1 at +512)
+    mov     rbp, [rbx + CTX_MAX_SEQ]
+    shl     rbp, 2                      ; rbp = score row bytes
+    mov     rax, [rbx + CTX_N_HEADS]
+    imul    rax, r8
+    add     rax, r9
+    imul    rax, rbp
+    add     rax, [rbx + CTX_BUF_BSCR]
+    mov     r14, rax                    ; r14 = scores of head h (h + 1 at +rbp)
+    mov     rax, r9
+    xor     edx, edx
+    div     qword [rel ab_gqa]          ; kv head
+    imul    rax, rbp
+    shl     rax, 7                      ; kv_h * max_seq * 512
+    add     rax, [rel ab_kvbase]
+    mov     r15, [rbx + CTX_BUF_K_CACHE]
+    add     r15, rax                    ; r15 = K rows of the kv head
+    add     rax, [rbx + CTX_BUF_V_CACHE]
+    mov     [rsp + AP_VBASE], rax
+
+    ; Scores of both heads, one position at a time
+    vbroadcastss ymm11, [rel ab_scale]
+    lea     r10, [r14 + rbp]
+    xor     ecx, ecx
+.sc_lp:
+    mov     rax, rcx
+    shl     rax, 9
+    add     rax, r15                    ; K row of position t
+    vxorps  ymm0, ymm0, ymm0
+    vxorps  ymm1, ymm1, ymm1
+    vxorps  ymm2, ymm2, ymm2
+    vxorps  ymm3, ymm3, ymm3
+    vxorps  ymm4, ymm4, ymm4
+    vxorps  ymm5, ymm5, ymm5
+    vxorps  ymm6, ymm6, ymm6
+    vxorps  ymm7, ymm7, ymm7
+    AP_SC   0, 0, 4
+    AP_SC   1, 1, 5
+    AP_SC   2, 2, 6
+    AP_SC   3, 3, 7
+    AP_SC   4, 0, 4
+    AP_SC   5, 1, 5
+    AP_SC   6, 2, 6
+    AP_SC   7, 3, 7
+    AP_SC   8, 0, 4
+    AP_SC   9, 1, 5
+    AP_SC   10, 2, 6
+    AP_SC   11, 3, 7
+    AP_SC   12, 0, 4
+    AP_SC   13, 1, 5
+    AP_SC   14, 2, 6
+    AP_SC   15, 3, 7
+    vaddps  ymm0, ymm0, ymm1            ; reduction order of dot_f32_avx2
+    vaddps  ymm2, ymm2, ymm3
+    vaddps  ymm0, ymm0, ymm2
+    vaddps  ymm4, ymm4, ymm5
+    vaddps  ymm6, ymm6, ymm7
+    vaddps  ymm4, ymm4, ymm6
+    vperm2f128 ymm1, ymm0, ymm4, 0x20   ; [low half h | low half h + 1]
+    vperm2f128 ymm2, ymm0, ymm4, 0x31   ; [high half h | high half h + 1]
+    vaddps  ymm1, ymm1, ymm2
+    vhaddps ymm1, ymm1, ymm1
+    vhaddps ymm1, ymm1, ymm1
+    vmulps  ymm1, ymm1, ymm11           ; * att_scale
+    vmovss  [r14 + rcx*4], xmm1
+    vextractf128 xmm2, ymm1, 1
+    vmovss  [r10 + rcx*4], xmm2
+    inc     rcx
+    cmp     rcx, r12
+    jb      .sc_lp
+
+    mov     rdi, r14
+    mov     rsi, r12
+    call    softmax_avx2
+    lea     rdi, [r14 + rbp]
+    mov     rsi, r12
+    call    softmax_avx2
+
+    ; Outputs: 4 blocks of 32 floats per head, accumulated over all positions
+    lea     r10, [r14 + rbp]
+    xor     r8d, r8d                    ; block byte offset
+.vb_lp:
+    vxorps  ymm0, ymm0, ymm0
+    vxorps  ymm1, ymm1, ymm1
+    vxorps  ymm2, ymm2, ymm2
+    vxorps  ymm3, ymm3, ymm3
+    vxorps  ymm4, ymm4, ymm4
+    vxorps  ymm5, ymm5, ymm5
+    vxorps  ymm6, ymm6, ymm6
+    vxorps  ymm7, ymm7, ymm7
+    mov     rax, [rsp + AP_VBASE]
+    add     rax, r8
+    xor     ecx, ecx
+.vt_lp:
+    vbroadcastss ymm8, [r14 + rcx*4]
+    vbroadcastss ymm9, [r10 + rcx*4]
+    AP_VC   0, 0, 4
+    AP_VC   1, 1, 5
+    AP_VC   2, 2, 6
+    AP_VC   3, 3, 7
+    add     rax, 512
+    inc     rcx
+    cmp     rcx, r12
+    jb      .vt_lp
+    mov     rdx, [rsp + AP_OUT]
+    add     rdx, r8
+    vmovups [rdx], ymm0
+    vmovups [rdx + 32], ymm1
+    vmovups [rdx + 64], ymm2
+    vmovups [rdx + 96], ymm3
+    vmovups [rdx + 512], ymm4
+    vmovups [rdx + 544], ymm5
+    vmovups [rdx + 576], ymm6
+    vmovups [rdx + 608], ymm7
+    add     r8, 128
+    cmp     r8, 512
+    jb      .vb_lp
+
+    vzeroupper
+    add     rsp, 24
+    pop     r15
+    pop     r14
+    pop     r13
+    pop     r12
+    pop     rbp
+    pop     rbx
+    ret
+
+; ----------------------------------------------------------------------------
 ; void transformer_forward_batch(const uint32 *toks, uint64 B, uint64 pos0,
 ;                                int compute_logits)
 ; Prompt prefill of B <= MAX_BATCH tokens at positions pos0 .. pos0 + B - 1.
-; Each layer streams its weights once for the whole batch (tp_matmul_batch);
-; every other step runs the single-token code per token, and token t attends
-; to positions 0 .. pos0 + t after all K/V of the batch are in the cache.
+; Each layer streams its weights once for the whole batch (tp_matmul_batch) and
+; runs the attention of all tokens as one pool job (attn_pair_item); token t
+; attends to positions 0 .. pos0 + t after all K/V of the batch are in the
+; cache. Norms, RoPE and residual adds run the single-token code per token.
 ; The KV cache and the final logits are bit-identical to B calls of
 ; transformer_forward.
 ; ----------------------------------------------------------------------------
@@ -1089,6 +1297,7 @@ gqa_attn_range:
 %define FB_SAVE_Q    120
 %define FB_SAVE_ATT  128
 %define FB_ROPE      136
+%define FB_PAIR      144                 ; 1 = batched attention kernel applies
 
 ; Per-token loop helper: rax = t * (bytes per token of field) + buffer
 %macro TOK_OFS 3                         ; dst, per-token bytes (reg/mem), buffer field
@@ -1121,6 +1330,14 @@ transformer_forward_batch:
     xor     edx, edx
     div     qword [rbx + CTX_N_KV_HEADS]
     mov     [rsp + FB_SCALE + 4], eax
+    xor     ecx, ecx                    ; attn_pair_item needs head_dim 128 and
+    test    eax, 1                      ; pairs of query heads per kv head
+    jnz     .fb_pair_set
+    cmp     qword [rbx + CTX_HEAD_DIM], 128
+    jne     .fb_pair_set
+    mov     ecx, 1
+.fb_pair_set:
+    mov     [rsp + FB_PAIR], rcx
     mov     rax, [rbx + CTX_Q_DIM]
     add     rax, [rbx + CTX_KV_DIM]
     add     rax, [rbx + CTX_KV_DIM]
@@ -1346,7 +1563,27 @@ transformer_forward_batch:
     jmp     .fb_tok
 .fb_tok_done:
 
-    ; Attention per token: point buf_q / buf_att_out at token t (no copies)
+    ; Attention of the whole batch in one pool job: a chunk is a pair of
+    ; query heads of one token
+    cmp     qword [rsp + FB_PAIR], 0
+    je      .fb_att_tok
+    mov     [rel ab_b], r12
+    mov     rax, [rsp + FB_POS0]
+    mov     [rel ab_pos0], rax
+    mov     rax, [rsp + FB_KVBASE]
+    mov     [rel ab_kvbase], rax
+    mov     eax, [rsp + FB_SCALE]
+    mov     [rel ab_scale], eax
+    mov     eax, [rsp + FB_SCALE + 4]
+    mov     [rel ab_gqa], rax
+    mov     rdi, [rbx + CTX_N_HEADS]
+    shr     rdi, 1                      ; head pairs
+    imul    rdi, r12
+    call    tp_attn_batch
+    jmp     .fb_oproj
+
+    ; Otherwise per token: point buf_q / buf_att_out at token t (no copies)
+.fb_att_tok:
     mov     rax, [rbx + CTX_BUF_Q]
     mov     [rsp + FB_SAVE_Q], rax
     mov     rax, [rbx + CTX_BUF_ATT_OUT]
@@ -1383,6 +1620,7 @@ transformer_forward_batch:
     mov     [rbx + CTX_BUF_ATT_OUT], rax
 
     ; Output projection for the batch + residual per token
+.fb_oproj:
     mov     rax, [rbx + CTX_Q_DIM]
     shl     rax, 2
     mov     [rel g_mm_xstride], rax
@@ -1530,3 +1768,13 @@ section .bss
 alignb 64
 g_ctx: resb CTX_SIZE
 g_use_hugepages: resd 1
+%if FAST_Q8
+%ifndef BARE_METAL
+alignb 8
+ab_b:      resq 1                       ; tokens in the batch (batched attention)
+ab_pos0:   resq 1                       ; position of the first token
+ab_kvbase: resq 1                       ; KV cache byte offset of the layer
+ab_gqa:    resq 1                       ; query heads per kv head
+ab_scale:  resd 1                       ; 1 / sqrt(head_dim)
+%endif
+%endif
