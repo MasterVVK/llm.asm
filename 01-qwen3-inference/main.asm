@@ -34,6 +34,7 @@ extern tok_write_stdout
 extern model_init
 extern model_free
 extern transformer_forward
+extern transformer_forward_batch
 
 section .text
 
@@ -52,6 +53,7 @@ _start:
     mov     qword [rel opt_max_tok], 128
     mov     qword [rel opt_threads], 32
     mov     qword [rel opt_ctx_len], 2048
+    mov     qword [rel opt_batch], DEFAULT_BATCH
     mov     dword [rel opt_think], 0
     mov     dword [rel opt_raw], 0
     mov     dword [rel opt_chat], 0
@@ -174,8 +176,26 @@ _start:
     lea     rsi, [rel flg_nohp]
     call    str_eq
     test    eax, eax
-    jz      .chk_tokens
+    jz      .chk_batch
     mov     dword [rel g_use_hugepages], 0
+    jmp     .arg_next
+
+.chk_batch:
+    mov     rdi, r14
+    lea     rsi, [rel flg_batch]
+    call    str_eq
+    test    eax, eax
+    jz      .chk_tokens
+    inc     rbx
+    cmp     rbx, r12
+    jae     .usage
+    mov     rdi, [r13 + rbx*8]
+    call    parse_u64
+    cmp     rax, MAX_BATCH
+    jbe     .batch_ok
+    mov     eax, MAX_BATCH
+.batch_ok:
+    mov     [rel opt_batch], rax
     jmp     .arg_next
 
 .chk_tokens:
@@ -596,6 +616,31 @@ run_tokens:
     mov     r13, [rel g_chat_pos]       ; pos = g_chat_pos
     xor     ebx, ebx                    ; i = 0
     mov     r14, [rbp + CTX_BUF_PROMPT]
+    ; Batched prefill (v2 fp16 models): MAX_BATCH tokens per weight pass
+    cmp     qword [rel opt_batch], 1
+    jbe     .prefill_lp
+    cmp     dword [rbp + CTX_FP16_SCALES], 0
+    je      .prefill_lp
+.prefill_blp:
+    cmp     rbx, r12
+    jae     .prefill_done
+    mov     rsi, r12
+    sub     rsi, rbx
+    cmp     rsi, [rel opt_batch]
+    jbe     .prefill_b_ok
+    mov     rsi, [rel opt_batch]
+.prefill_b_ok:
+    mov     r15, rsi                    ; tokens in this pass
+    lea     rdi, [r14 + rbx*4]
+    mov     rdx, r13                    ; pos0
+    lea     rax, [rbx + rsi]
+    xor     ecx, ecx
+    cmp     rax, r12
+    sete    cl                          ; logits only after the last pass
+    call    transformer_forward_batch
+    add     rbx, r15
+    add     r13, r15
+    jmp     .prefill_blp
 .prefill_lp:
     cmp     rbx, r12
     jae     .prefill_done
@@ -965,6 +1010,7 @@ flg_think:      db "--think", 0
 flg_raw:        db "--raw", 0
 flg_hp:         db "--hugepages", 0
 flg_nohp:       db "--nohugepages", 0
+flg_batch:      db "--batch", 0
 flg_tokens:     db "--tokens", 0
 flg_temp:       db "--temp", 0
 flg_topp:       db "--topp", 0
@@ -1019,6 +1065,8 @@ msg_usage:
     db "  --raw                Do not wrap prompt in Qwen3 chat template", 10
     db "  --tokens <csv>       Pass exact comma-separated token IDs", 10
     db "  --temp <float>       Temperature (0.0 = greedy, default: 0.0)", 10
+    db "  --batch <n>          Prompt tokens per weight pass (default: 8, max: 16, 1 = per token)", 10
+    db "  --hugepages          Copy weights to 2 MiB transparent huge pages", 10
     db "  --topp <float>       Top-p threshold when temp > 0 (default: 0.95)", 10
     db "  --seed <uint>        PRNG seed for sampling (default: 42)", 10
     db "  --dump-logits <path> Dump float32 prefill logits to file", 10
@@ -1027,6 +1075,7 @@ msg_usage:
 section .bss
 alignb 8
 opt_model:        resq 1
+opt_batch:        resq 1
 opt_prompt:       resq 1
 opt_max_tok:      resq 1
 opt_threads:      resq 1

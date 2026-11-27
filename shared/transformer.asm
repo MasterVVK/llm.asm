@@ -43,6 +43,10 @@ extern saxpy_f32_avx2
 extern tp_matmul_q8_0
 %if FAST_Q8
 extern tp_gqa_attn
+%ifndef BARE_METAL
+extern tp_matmul_batch
+extern g_mm_xstride
+%endif
 %endif
 
 section .text
@@ -54,6 +58,9 @@ global model_free
 global transformer_forward
 %if FAST_Q8
 global gqa_attn_range
+%ifndef BARE_METAL
+global transformer_forward_batch
+%endif
 %endif
 
 ; Helper macro: align reg up to 64 bytes
@@ -289,6 +296,32 @@ model_init:
     ALLOC_BUF CTX_BUF_K_CACHE, rax
     ALLOC_BUF CTX_BUF_V_CACHE, rax
 
+    ; Batched prefill buffers (MAX_BATCH tokens)
+    mov     rax, [rbx + CTX_DIM]
+    shl     rax, 2
+    imul    rax, rax, MAX_BATCH
+    ALLOC_BUF CTX_BUF_BX, rax
+    ALLOC_BUF CTX_BUF_BXB, rax
+    mov     rax, [rbx + CTX_KV_DIM]
+    add     rax, rax
+    add     rax, [rbx + CTX_Q_DIM]
+    shl     rax, 2
+    imul    rax, rax, MAX_BATCH
+    ALLOC_BUF CTX_BUF_BQKV, rax
+    mov     rax, [rbx + CTX_Q_DIM]
+    shl     rax, 2
+    imul    rax, rax, MAX_BATCH
+    ALLOC_BUF CTX_BUF_BATT, rax
+    mov     rax, [rbx + CTX_HIDDEN_DIM]
+    shl     rax, 3                      ; [gate | up] per token
+    imul    rax, rax, MAX_BATCH
+    ALLOC_BUF CTX_BUF_BGU, rax
+    mov     rax, [rbx + CTX_HEAD_DIM]
+    shl     rax, 1                      ; (head_dim / 2) floats per token
+    imul    rax, rax, MAX_BATCH
+    ALLOC_BUF CTX_BUF_BCOS, rax
+    ALLOC_BUF CTX_BUF_BSIN, rax
+
     ALIGN64 rbp
     mov     [rbx + CTX_ARENA_SIZE], rbp
 
@@ -307,6 +340,13 @@ model_init:
     add     rcx, 8
     dec     edx
     jnz     .reloc_lp
+    lea     rcx, [rbx + CTX_BUF_BX]     ; and the 7 batched prefill buffers
+    mov     edx, 7
+.reloc2_lp:
+    add     [rcx], rax
+    add     rcx, 8
+    dec     edx
+    jnz     .reloc2_lp
 
     ; Precompute exact FP64 RoPE inverse frequencies
     mov     rdi, [rbx + CTX_BUF_INV_FREQ]
@@ -1018,6 +1058,469 @@ gqa_attn_range:
     pop     rbx
     ret
 %endif
+
+%if FAST_Q8
+%ifndef BARE_METAL
+; ----------------------------------------------------------------------------
+; void transformer_forward_batch(const uint32 *toks, uint64 B, uint64 pos0,
+;                                int compute_logits)
+; Prompt prefill of B <= MAX_BATCH tokens at positions pos0 .. pos0 + B - 1.
+; Each layer streams its weights once for the whole batch (tp_matmul_batch);
+; every other step runs the single-token code per token, and token t attends
+; to positions 0 .. pos0 + t after all K/V of the batch are in the cache.
+; The KV cache and the final logits are bit-identical to B calls of
+; transformer_forward.
+; ----------------------------------------------------------------------------
+%define FB_TOKS      0
+%define FB_POS0      8
+%define FB_LOGITS    16
+%define FB_LAYER     24
+%define FB_IN_NORM   32
+%define FB_Q_NORM    40
+%define FB_K_NORM    48
+%define FB_POST_NORM 56
+%define FB_QKV       64
+%define FB_O         72
+%define FB_GU        80
+%define FB_DOWN      88
+%define FB_SCALE     96                  ; f32 att_scale, gqa ratio at +4
+%define FB_KVBASE    104
+%define FB_QKVM      112                 ; q_dim + 2 * kv_dim
+%define FB_SAVE_Q    120
+%define FB_SAVE_ATT  128
+%define FB_ROPE      136
+
+; Per-token loop helper: rax = t * (bytes per token of field) + buffer
+%macro TOK_OFS 3                         ; dst, per-token bytes (reg/mem), buffer field
+    mov     %1, %2
+    imul    %1, r13
+    add     %1, [rbx + %3]
+%endmacro
+
+transformer_forward_batch:
+    push    rbx
+    push    rbp
+    push    r12
+    push    r13
+    push    r14
+    push    r15
+    sub     rsp, 168
+    mov     [rsp + FB_TOKS], rdi
+    mov     r12, rsi                    ; B
+    mov     [rsp + FB_POS0], rdx
+    mov     [rsp + FB_LOGITS], rcx
+    lea     rbx, [rel g_ctx]
+
+    mov     rax, [rbx + CTX_HEAD_DIM]
+    vcvtsi2ss xmm0, xmm0, rax
+    vsqrtss xmm0, xmm0, xmm0
+    vmovss  xmm1, [rel t_one]
+    vdivss  xmm1, xmm1, xmm0
+    vmovss  [rsp + FB_SCALE], xmm1
+    mov     rax, [rbx + CTX_N_HEADS]
+    xor     edx, edx
+    div     qword [rbx + CTX_N_KV_HEADS]
+    mov     [rsp + FB_SCALE + 4], eax
+    mov     rax, [rbx + CTX_Q_DIM]
+    add     rax, [rbx + CTX_KV_DIM]
+    add     rax, [rbx + CTX_KV_DIM]
+    mov     [rsp + FB_QKVM], rax
+
+    ; 1. Embeddings and RoPE tables of every token
+    xor     r13d, r13d
+.fb_emb:
+    cmp     r13, r12
+    jae     .fb_emb_done
+    mov     rax, [rsp + FB_TOKS]
+    mov     edi, [rax + r13*4]
+    mov     rax, [rbx + CTX_DIM]
+    mov     ecx, [rbx + CTX_SCALE_SHIFT]
+    mov     rdx, rax
+    shr     rdx, cl
+    add     rdx, rax                    ; embedding row stride
+    imul    rdi, rdx
+    add     rdi, [rbx + CTX_EMB_PTR]
+    mov     rsi, rax
+    shl     rsi, 2
+    imul    rsi, r13
+    add     rsi, [rbx + CTX_BUF_BX]
+    mov     rdx, rax
+    call    dequant_row_q8_0
+    mov     rax, [rbx + CTX_HEAD_DIM]
+    shl     rax, 1                      ; (head_dim / 2) * 4 bytes
+    imul    rax, r13
+    mov     rdi, [rbx + CTX_BUF_BCOS]
+    add     rdi, rax
+    mov     rsi, [rbx + CTX_BUF_BSIN]
+    add     rsi, rax
+    mov     rdx, [rbx + CTX_BUF_INV_FREQ]
+    mov     rcx, [rbx + CTX_HEAD_DIM]
+    shr     rcx, 1
+    mov     r8, [rsp + FB_POS0]
+    add     r8, r13
+    call    compute_rope_cs
+    inc     r13
+    jmp     .fb_emb
+.fb_emb_done:
+
+    mov     qword [rsp + FB_LAYER], 0
+.fb_layer:
+    mov     rax, [rsp + FB_LAYER]
+    cmp     rax, [rbx + CTX_N_LAYERS]
+    jae     .fb_layers_done
+
+    ; Tensor pointers of layer l (same layout as transformer_forward)
+    imul    rax, [rbx + CTX_LAYER_STRIDE]
+    add     rax, [rbx + CTX_LAYERS_PTR]
+    mov     [rsp + FB_IN_NORM], rax
+    mov     rcx, [rbx + CTX_DIM]
+    shl     rcx, 2
+    add     rax, rcx
+    mov     [rsp + FB_Q_NORM], rax
+    mov     rcx, [rbx + CTX_HEAD_DIM]
+    shl     rcx, 2
+    add     rax, rcx
+    mov     [rsp + FB_K_NORM], rax
+    add     rax, rcx
+    mov     [rsp + FB_POST_NORM], rax
+    mov     rcx, [rbx + CTX_DIM]
+    shl     rcx, 2
+    add     rax, rcx
+    mov     ecx, [rbx + CTX_SCALE_SHIFT]
+    mov     r14, [rbx + CTX_DIM]
+    mov     r15, r14
+    shr     r15, cl
+    add     r14, r15                    ; dim row stride
+    ALIGN64 rax
+    mov     [rsp + FB_QKV], rax         ; q, k, v rows are contiguous
+    mov     rcx, [rsp + FB_QKVM]
+    imul    rcx, r14
+    add     rax, rcx
+    ALIGN64 rax
+    mov     [rsp + FB_O], rax
+    mov     ecx, [rbx + CTX_SCALE_SHIFT]
+    mov     r15, [rbx + CTX_Q_DIM]
+    mov     rdx, r15
+    shr     rdx, cl
+    add     r15, rdx                    ; q_dim row stride
+    imul    r15, [rbx + CTX_DIM]
+    add     rax, r15
+    ALIGN64 rax
+    mov     [rsp + FB_GU], rax          ; gate, up rows are contiguous
+    mov     rcx, [rbx + CTX_HIDDEN_DIM]
+    add     rcx, rcx
+    imul    rcx, r14
+    add     rax, rcx
+    ALIGN64 rax
+    mov     [rsp + FB_DOWN], rax
+    mov     rax, [rsp + FB_LAYER]       ; layer_kv_base = l * max_seq * kv_dim * 4
+    imul    rax, [rbx + CTX_MAX_SEQ]
+    imul    rax, [rbx + CTX_KV_DIM]
+    shl     rax, 2
+    mov     [rsp + FB_KVBASE], rax
+
+    ; Input RMSNorm of every token
+    xor     r13d, r13d
+.fb_n1:
+    cmp     r13, r12
+    jae     .fb_n1_done
+    mov     rax, [rbx + CTX_DIM]
+    shl     rax, 2
+    imul    rax, r13
+    mov     rdi, [rbx + CTX_BUF_BXB]
+    add     rdi, rax
+    mov     rsi, [rbx + CTX_BUF_BX]
+    add     rsi, rax
+    mov     rdx, [rsp + FB_IN_NORM]
+    mov     rcx, [rbx + CTX_DIM]
+    vmovss  xmm0, [rbx + CTX_RMS_EPS]
+    call    rmsnorm_avx2
+    inc     r13
+    jmp     .fb_n1
+.fb_n1_done:
+
+    ; Fused Q + K + V for the whole batch
+    mov     rax, [rbx + CTX_DIM]
+    shl     rax, 2
+    mov     [rel g_mm_xstride], rax
+    mov     rdi, [rsp + FB_QKV]
+    mov     rsi, [rbx + CTX_BUF_BXB]
+    mov     rdx, [rbx + CTX_BUF_BQKV]
+    mov     rcx, [rsp + FB_QKVM]
+    mov     r8, [rbx + CTX_DIM]
+    mov     r9, r12
+    call    tp_matmul_batch
+
+    ; Per token: QK-norm, RoPE, K/V into the cache at pos0 + t
+    xor     r13d, r13d
+.fb_tok:
+    cmp     r13, r12
+    jae     .fb_tok_done
+    mov     r14, [rsp + FB_QKVM]
+    shl     r14, 2
+    imul    r14, r13
+    add     r14, [rbx + CTX_BUF_BQKV]   ; q of token t (k, v follow)
+    mov     r15, r14
+    mov     rbp, [rbx + CTX_N_HEADS]
+.fb_qn:
+    mov     rdi, r15
+    mov     rsi, r15
+    mov     rdx, [rsp + FB_Q_NORM]
+    mov     rcx, [rbx + CTX_HEAD_DIM]
+    vmovss  xmm0, [rbx + CTX_RMS_EPS]
+    call    rmsnorm_avx2
+    mov     rax, [rbx + CTX_HEAD_DIM]
+    lea     r15, [r15 + rax*4]
+    dec     rbp
+    jnz     .fb_qn
+    mov     rbp, [rbx + CTX_N_KV_HEADS] ; r15 = k of token t
+.fb_kn:
+    mov     rdi, r15
+    mov     rsi, r15
+    mov     rdx, [rsp + FB_K_NORM]
+    mov     rcx, [rbx + CTX_HEAD_DIM]
+    vmovss  xmm0, [rbx + CTX_RMS_EPS]
+    call    rmsnorm_avx2
+    mov     rax, [rbx + CTX_HEAD_DIM]
+    lea     r15, [r15 + rax*4]
+    dec     rbp
+    jnz     .fb_kn
+    mov     rax, [rbx + CTX_HEAD_DIM]
+    shl     rax, 1
+    imul    rax, r13
+    mov     [rsp + FB_ROPE], rax
+    mov     rdi, r14
+    mov     rsi, [rbx + CTX_BUF_BCOS]
+    add     rsi, rax
+    mov     rdx, [rbx + CTX_BUF_BSIN]
+    add     rdx, rax
+    mov     rcx, [rbx + CTX_N_HEADS]
+    mov     r8, [rbx + CTX_HEAD_DIM]
+    call    rope_apply_avx2
+    mov     rax, [rbx + CTX_Q_DIM]
+    lea     rdi, [r14 + rax*4]
+    mov     rax, [rsp + FB_ROPE]
+    mov     rsi, [rbx + CTX_BUF_BCOS]
+    add     rsi, rax
+    mov     rdx, [rbx + CTX_BUF_BSIN]
+    add     rdx, rax
+    mov     rcx, [rbx + CTX_N_KV_HEADS]
+    mov     r8, [rbx + CTX_HEAD_DIM]
+    call    rope_apply_avx2
+    mov     r8, [rbx + CTX_HEAD_DIM]
+    shl     r8, 2                       ; head_bytes
+    mov     r9, [rbx + CTX_MAX_SEQ]
+    imul    r9, r8                      ; kv_head_stride
+    mov     rcx, [rsp + FB_POS0]
+    add     rcx, r13
+    imul    rcx, r8
+    add     rcx, [rsp + FB_KVBASE]
+    mov     rdi, [rbx + CTX_BUF_K_CACHE]
+    add     rdi, rcx
+    mov     rdx, [rbx + CTX_BUF_V_CACHE]
+    add     rdx, rcx
+    mov     rax, [rbx + CTX_Q_DIM]
+    lea     rsi, [r14 + rax*4]          ; k_t
+    mov     rax, [rbx + CTX_KV_DIM]
+    lea     r10, [rsi + rax*4]          ; v_t
+    mov     r11, [rbx + CTX_N_KV_HEADS]
+.fb_kvh:
+    xor     eax, eax
+.fb_kvc:
+    cmp     rax, r8
+    jae     .fb_kvn
+    vmovups ymm0, [rsi + rax]
+    vmovups ymm1, [r10 + rax]
+    vmovups [rdi + rax], ymm0
+    vmovups [rdx + rax], ymm1
+    add     rax, 32
+    jmp     .fb_kvc
+.fb_kvn:
+    add     rsi, r8
+    add     r10, r8
+    add     rdi, r9
+    add     rdx, r9
+    dec     r11
+    jnz     .fb_kvh
+    inc     r13
+    jmp     .fb_tok
+.fb_tok_done:
+
+    ; Attention per token: point buf_q / buf_att_out at token t (no copies)
+    mov     rax, [rbx + CTX_BUF_Q]
+    mov     [rsp + FB_SAVE_Q], rax
+    mov     rax, [rbx + CTX_BUF_ATT_OUT]
+    mov     [rsp + FB_SAVE_ATT], rax
+    xor     r13d, r13d
+.fb_att:
+    cmp     r13, r12
+    jae     .fb_att_done
+    mov     rax, [rsp + FB_QKVM]
+    shl     rax, 2
+    imul    rax, r13
+    add     rax, [rbx + CTX_BUF_BQKV]
+    mov     [rbx + CTX_BUF_Q], rax
+    mov     rax, [rbx + CTX_Q_DIM]
+    shl     rax, 2
+    imul    rax, r13
+    add     rax, [rbx + CTX_BUF_BATT]
+    mov     [rbx + CTX_BUF_ATT_OUT], rax
+    mov     rdi, [rsp + FB_KVBASE]
+    mov     rsi, [rsp + FB_POS0]
+    add     rsi, r13
+    mov     edx, [rsp + FB_SCALE + 4]
+    shl     rdx, 32
+    mov     eax, [rsp + FB_SCALE]
+    or      rdx, rax
+    mov     rcx, [rbx + CTX_N_HEADS]
+    call    tp_gqa_attn
+    inc     r13
+    jmp     .fb_att
+.fb_att_done:
+    mov     rax, [rsp + FB_SAVE_Q]
+    mov     [rbx + CTX_BUF_Q], rax
+    mov     rax, [rsp + FB_SAVE_ATT]
+    mov     [rbx + CTX_BUF_ATT_OUT], rax
+
+    ; Output projection for the batch + residual per token
+    mov     rax, [rbx + CTX_Q_DIM]
+    shl     rax, 2
+    mov     [rel g_mm_xstride], rax
+    mov     rdi, [rsp + FB_O]
+    mov     rsi, [rbx + CTX_BUF_BATT]
+    mov     rdx, [rbx + CTX_BUF_BXB]
+    mov     rcx, [rbx + CTX_DIM]
+    mov     r8, [rbx + CTX_Q_DIM]
+    mov     r9, r12
+    call    tp_matmul_batch
+    xor     r13d, r13d
+.fb_r1:
+    cmp     r13, r12
+    jae     .fb_r1_done
+    mov     rax, [rbx + CTX_DIM]
+    shl     rax, 2
+    imul    rax, r13
+    mov     rdi, [rbx + CTX_BUF_BX]
+    add     rdi, rax
+    mov     rsi, [rbx + CTX_BUF_BXB]
+    add     rsi, rax
+    mov     rdx, [rbx + CTX_DIM]
+    call    vec_add_avx2
+    inc     r13
+    jmp     .fb_r1
+.fb_r1_done:
+
+    ; Post-attention RMSNorm of every token
+    xor     r13d, r13d
+.fb_n2:
+    cmp     r13, r12
+    jae     .fb_n2_done
+    mov     rax, [rbx + CTX_DIM]
+    shl     rax, 2
+    imul    rax, r13
+    mov     rdi, [rbx + CTX_BUF_BXB]
+    add     rdi, rax
+    mov     rsi, [rbx + CTX_BUF_BX]
+    add     rsi, rax
+    mov     rdx, [rsp + FB_POST_NORM]
+    mov     rcx, [rbx + CTX_DIM]
+    vmovss  xmm0, [rbx + CTX_RMS_EPS]
+    call    rmsnorm_avx2
+    inc     r13
+    jmp     .fb_n2
+.fb_n2_done:
+
+    ; Fused gate + up for the batch, SwiGLU per token
+    mov     rax, [rbx + CTX_DIM]
+    shl     rax, 2
+    mov     [rel g_mm_xstride], rax
+    mov     rdi, [rsp + FB_GU]
+    mov     rsi, [rbx + CTX_BUF_BXB]
+    mov     rdx, [rbx + CTX_BUF_BGU]
+    mov     rcx, [rbx + CTX_HIDDEN_DIM]
+    add     rcx, rcx
+    mov     r8, [rbx + CTX_DIM]
+    mov     r9, r12
+    call    tp_matmul_batch
+    xor     r13d, r13d
+.fb_silu:
+    cmp     r13, r12
+    jae     .fb_silu_done
+    mov     rax, [rbx + CTX_HIDDEN_DIM]
+    shl     rax, 3
+    imul    rax, r13
+    add     rax, [rbx + CTX_BUF_BGU]
+    mov     rdi, rax
+    mov     rsi, [rbx + CTX_HIDDEN_DIM]
+    lea     rsi, [rax + rsi*4]
+    mov     rdx, [rbx + CTX_HIDDEN_DIM]
+    call    silu_mul_avx2
+    inc     r13
+    jmp     .fb_silu
+.fb_silu_done:
+
+    ; Down projection for the batch (input = gate half of each token) + residual
+    mov     rax, [rbx + CTX_HIDDEN_DIM]
+    shl     rax, 3
+    mov     [rel g_mm_xstride], rax
+    mov     rdi, [rsp + FB_DOWN]
+    mov     rsi, [rbx + CTX_BUF_BGU]
+    mov     rdx, [rbx + CTX_BUF_BXB]
+    mov     rcx, [rbx + CTX_DIM]
+    mov     r8, [rbx + CTX_HIDDEN_DIM]
+    mov     r9, r12
+    call    tp_matmul_batch
+    xor     r13d, r13d
+.fb_r2:
+    cmp     r13, r12
+    jae     .fb_r2_done
+    mov     rax, [rbx + CTX_DIM]
+    shl     rax, 2
+    imul    rax, r13
+    mov     rdi, [rbx + CTX_BUF_BX]
+    add     rdi, rax
+    mov     rsi, [rbx + CTX_BUF_BXB]
+    add     rsi, rax
+    mov     rdx, [rbx + CTX_DIM]
+    call    vec_add_avx2
+    inc     r13
+    jmp     .fb_r2
+.fb_r2_done:
+
+    inc     qword [rsp + FB_LAYER]
+    jmp     .fb_layer
+
+.fb_layers_done:
+    cmp     qword [rsp + FB_LOGITS], 0
+    je      .fb_done
+    ; Final RMSNorm of the last token into buf_x + tied LM head
+    lea     rax, [r12 - 1]
+    imul    rax, [rbx + CTX_DIM]
+    shl     rax, 2
+    add     rax, [rbx + CTX_BUF_BX]
+    mov     rdi, [rbx + CTX_BUF_X]
+    mov     rsi, rax
+    mov     rdx, [rbx + CTX_FINAL_NORM_PTR]
+    mov     rcx, [rbx + CTX_DIM]
+    vmovss  xmm0, [rbx + CTX_RMS_EPS]
+    call    rmsnorm_avx2
+    mov     rdi, [rbx + CTX_EMB_PTR]
+    mov     rsi, [rbx + CTX_BUF_X]
+    mov     rdx, [rbx + CTX_BUF_LOGITS]
+    mov     rcx, [rbx + CTX_VOCAB_SIZE]
+    mov     r8, [rbx + CTX_DIM]
+    call    tp_matmul_q8_0
+.fb_done:
+    add     rsp, 168
+    pop     r15
+    pop     r14
+    pop     r13
+    pop     r12
+    pop     rbp
+    pop     rbx
+    ret
+%endif ; !BARE_METAL
+%endif ; FAST_Q8
 
 section .rodata
 align 4

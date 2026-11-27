@@ -157,4 +157,15 @@
 %define CTX_BUF_PROBS       360
 %define CTX_FP16_SCALES     368         ; uint32: 0 = v1 fp32 scales, 1 = v2 fp16 scales
 %define CTX_SCALE_SHIFT     372         ; uint32: 3 = fp32 (K>>3), 4 = fp16 (K>>4)
-%define CTX_SIZE            384
+
+; Batched prefill buffers (MAX_BATCH tokens per pass, all inside the arena)
+%define MAX_BATCH           16
+%define DEFAULT_BATCH       8           ; best measured on Ivy Bridge: x fits L1 even for K = 3072
+%define CTX_BUF_BX          376         ; [MAX_BATCH][dim]
+%define CTX_BUF_BXB         384         ; [MAX_BATCH][dim]
+%define CTX_BUF_BQKV        392         ; [MAX_BATCH][q_dim + 2 * kv_dim]
+%define CTX_BUF_BATT        400         ; [MAX_BATCH][q_dim]
+%define CTX_BUF_BGU         408         ; [MAX_BATCH][2 * hidden_dim]
+%define CTX_BUF_BCOS        416         ; [MAX_BATCH][head_dim / 2]
+%define CTX_BUF_BSIN        424         ; [MAX_BATCH][head_dim / 2]
+%define CTX_SIZE            448

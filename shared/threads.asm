@@ -28,6 +28,11 @@ extern sys_mmap_anon
 extern matmul_q8_0_range
 %if FAST_Q8
 extern quantize_x_q8_0
+extern quantize_x_batch
+extern matmul_q8_0_batch_range
+extern g_mm_b
+extern g_mm_m4
+extern g_mm_xstride
 extern gqa_attn_range
 %endif
 
@@ -38,6 +43,7 @@ global tp_shutdown
 global tp_matmul_q8_0
 %if FAST_Q8
 global tp_gqa_attn
+global tp_matmul_batch
 %endif
 
 ; ----------------------------------------------------------------------------
@@ -216,8 +222,17 @@ tp_init:
 %endif
     mov     r8,  r14                    ; r0
     mov     r9,  r15                    ; r1
+%if FAST_Q8
+    cmp     dword [rel tp_mode], 0
+    jne     .run_batch
+%endif
     call    matmul_q8_0_range
     jmp     .job_done
+%if FAST_Q8
+.run_batch:
+    call    matmul_q8_0_batch_range
+    jmp     .job_done
+%endif
 %if FAST_Q8
 .run_attn:
     mov     rcx, r14                    ; h0
@@ -264,6 +279,7 @@ tp_shutdown:
 ; ----------------------------------------------------------------------------
 tp_matmul_q8_0:
 %if FAST_Q8
+    mov     dword [rel tp_mode], 0
     ; Quantize input vector x[0..K-1] to Q8_0 ONCE for all worker threads
     push    rdi
     push    rsi
@@ -279,6 +295,7 @@ tp_matmul_q8_0:
     pop     rsi
     pop     rdi
 %endif
+.dispatch:
     mov     rax, [rel tp_n_threads]
     cmp     rax, 1
     jle     .single_thread
@@ -335,8 +352,17 @@ tp_matmul_q8_0:
 %endif
     xor     r8d, r8d                    ; r0 = 0
     mov     r9,  rax                    ; r1
+%if FAST_Q8
+    cmp     dword [rel tp_mode], 0
+    jne     .main_batch
+%endif
     call    matmul_q8_0_range
     jmp     .wait_workers
+%if FAST_Q8
+.main_batch:
+    call    matmul_q8_0_batch_range
+    jmp     .wait_workers
+%endif
 %if FAST_Q8
 .main_attn:
     xor     ecx, ecx                    ; h0 = 0
@@ -373,7 +399,45 @@ tp_matmul_q8_0:
     mov     r9,  rcx                    ; r1 = M
     mov     rcx, r8                     ; K
     xor     r8d, r8d                    ; r0 = 0
+%if FAST_Q8
+    cmp     dword [rel tp_mode], 0
+    jne     matmul_q8_0_batch_range
+%endif
     jmp     matmul_q8_0_range
+
+%if FAST_Q8
+; ----------------------------------------------------------------------------
+; void tp_matmul_batch(const void *W, const float *X, float *OUT, uint64 M,
+;                      uint64 K, uint64 B)   X token stride: g_mm_xstride bytes
+; Batched prefill GEMM: OUT[t][0..M) = W . X[t] for t < B, rows split across
+; the pool exactly like tp_matmul_q8_0.
+; ----------------------------------------------------------------------------
+tp_matmul_batch:
+    push    rdi
+    push    rsi
+    push    rdx
+    push    rcx
+    push    r8
+    push    r9
+    sub     rsp, 8
+    mov     rdi, rsi                    ; X
+    mov     rsi, r8                     ; K
+    mov     rdx, r9                     ; B
+    mov     rcx, [rel g_mm_xstride]
+    call    quantize_x_batch
+    add     rsp, 8
+    pop     r9
+    pop     r8
+    pop     rcx
+    pop     rdx
+    pop     rsi
+    pop     rdi
+    mov     [rel g_mm_b], r9
+    lea     rax, [rcx * 4]
+    mov     [rel g_mm_m4], rax
+    mov     dword [rel tp_mode], 1
+    jmp     tp_matmul_q8_0.dispatch
+%endif
 
 %if FAST_Q8
 ; ----------------------------------------------------------------------------
@@ -429,6 +493,7 @@ tp_x:         resq 1
 tp_out:       resq 1
 tp_M:         resq 1
 tp_K:         resq 1
+tp_mode:      resd 1                    ; 0 = GEMV, 1 = batched prefill GEMM
 
 alignb 64
 tp_waiters:   resd 1

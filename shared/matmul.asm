@@ -33,6 +33,8 @@
 bits 64
 default rel
 
+%include "constants.inc"
+
 %ifndef FAST_Q8
 %define FAST_Q8 1
 %endif
@@ -42,12 +44,21 @@ default rel
 %endif
 
 %define Q8_MAX_K 16384
+%define XQ_STRIDE (Q8_MAX_K + 64)            ; per-token slot, +64 avoids L1 set aliasing
+%define XS_STRIDE ((Q8_MAX_K / 32) * 4 + 64)
 
 section .text
 
 global matmul_set_fp16
 %if FAST_Q8
 global quantize_x_q8_0
+%ifndef BARE_METAL
+global quantize_x_batch
+global matmul_q8_0_batch_range
+global g_mm_b
+global g_mm_m4
+global g_mm_xstride
+%endif
 %endif
 global dequant_row_q8_0
 global matmul_q8_0_range
@@ -139,11 +150,14 @@ dequant_row_q8_0:
 ; bytes in linear order (no vpermd fix-up needed).
 ; ----------------------------------------------------------------------------
 quantize_x_q8_0:
-    mov     rcx, rsi
-    shr     rcx, 5                      ; nb = K / 32
     lea     r9, [rel q8_xq]
     lea     r10, [rel q8_xs]
     lea     r11, [rel q8_xa]
+; quantize_core: rdi = x, rsi = K, r9 = xq, r10 = xs, r11 = xa.
+; Clobbers rax, rcx, rdx, r8 and SIMD registers only.
+quantize_core:
+    mov     rcx, rsi
+    shr     rcx, 5                      ; nb = K / 32
 
     vbroadcastss ymm12, [rel q8_abs_mask]
     vmovss  xmm13, [rel q8_inv_127]
@@ -419,6 +433,149 @@ align 16
     pop     rbx
     ret
 
+%ifndef BARE_METAL
+; ----------------------------------------------------------------------------
+; void quantize_x_batch(const float *X, uint64 K, uint64 B, uint64 x_stride_bytes)
+; Quantizes B activation vectors into per-token slots q8b_xq / q8b_xa / q8b_xs
+; with exactly the same code as quantize_x_q8_0.
+; ----------------------------------------------------------------------------
+quantize_x_batch:
+    push    rbx
+    push    r12
+    push    r13
+    push    r14
+    push    r15
+    mov     r12, rdi
+    mov     r13, rsi
+    mov     r14, rdx
+    mov     r15, rcx
+    xor     ebx, ebx
+.qb_lp:
+    cmp     rbx, r14
+    jae     .qb_done
+    mov     rdi, r12
+    mov     rsi, r13
+    imul    rax, rbx, XQ_STRIDE
+    lea     r9, [rel q8b_xq]
+    add     r9, rax
+    lea     r11, [rel q8b_xa]
+    add     r11, rax
+    imul    rax, rbx, XS_STRIDE
+    lea     r10, [rel q8b_xs]
+    add     r10, rax
+    call    quantize_core
+    add     r12, r15
+    inc     rbx
+    jmp     .qb_lp
+.qb_done:
+    pop     r15
+    pop     r14
+    pop     r13
+    pop     r12
+    pop     rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; void matmul_q8_0_batch_range(const void *W, (unused), float *out, uint64 K,
+;                              uint64 r0, uint64 r1)
+; Batched prefill GEMM over g_mm_b tokens (v2 fp16 scales). For every row the
+; per-token dot product runs the very same instruction sequence as the GEMV
+; kernel, so results are bit-identical to token-by-token prefill; the row is
+; read from DRAM once and from L1 for the remaining tokens.
+; out[t * M + r] with the token stride M * 4 taken from g_mm_m4.
+; ----------------------------------------------------------------------------
+matmul_q8_0_batch_range:
+    push    rbx
+    push    rbp
+    push    r12
+    push    r13
+    push    r14
+    push    r15
+    sub     rsp, 8                      ; [rsp] = out pointer of token 0 for this row
+
+    mov     rsi, r9
+    sub     rsi, r8                     ; rows
+    jle     .b_exit
+    lea     rdx, [rdx + r8 * 4]
+    mov     [rsp], rdx
+    vmovdqa xmm15, [rel q8_one16x8]
+    mov     r15, rcx                    ; K
+    mov     r13, rcx
+    and     r13, -128                   ; K_128
+    mov     r14, rcx
+    shr     r14, 4
+    add     r14, rcx                    ; row_stride (fp16 scales)
+    mov     rax, r8
+    imul    rax, r14
+    add     rax, rdi                    ; first row
+    mov     rcx, [rel g_mm_m4]          ; token stride in out (bytes)
+
+align 16
+.b_row:
+    lea     r8, [rax + r15]             ; fp16 scales of this row
+    mov     rdx, [rsp]
+    lea     r11, [rel q8b_xq]
+    lea     r10, [rel q8b_xa]
+    lea     rbp, [rel q8b_xs]
+    mov     rdi, [rel g_mm_b]
+.b_tok:
+    vxorps  xmm0, xmm0, xmm0
+    vxorps  xmm1, xmm1, xmm1
+    vxorps  xmm2, xmm2, xmm2
+    vxorps  xmm3, xmm3, xmm3
+    xor     ebx, ebx
+    xor     r9d, r9d
+    test    r13, r13
+    jz      .b_tail
+align 16
+.b_blk4:
+    vmovq      xmm12, qword [r8 + r9]
+    vcvtph2ps  xmm12, xmm12
+    vmulps     xmm12, xmm12, [rbp + r9*2]
+    INT8_1ROW_4BLK
+    add     rbx, 128
+    add     r9, 8
+    cmp     rbx, r13
+    jb      .b_blk4
+.b_tail:
+    cmp     rbx, r15
+    jae     .b_red
+    movzx   r12d, word [r8 + r9]
+    vmovd   xmm12, r12d
+    vcvtph2ps xmm12, xmm12
+    vmulss  xmm12, xmm12, [rbp + r9*2]
+    INT8_BLK_AVX1 0, xmm0, 0x00
+    add     rbx, 32
+    add     r9, 2
+    jmp     .b_tail
+.b_red:
+    vaddps  xmm0, xmm0, xmm1
+    vaddps  xmm2, xmm2, xmm3
+    vaddps  xmm0, xmm0, xmm2
+    vhaddps xmm0, xmm0, xmm0
+    vhaddps xmm0, xmm0, xmm0
+    vmovss  [rdx], xmm0
+    add     rdx, rcx
+    add     r11, XQ_STRIDE
+    add     r10, XQ_STRIDE
+    add     rbp, XS_STRIDE
+    dec     rdi
+    jnz     .b_tok
+    add     qword [rsp], 4
+    add     rax, r14
+    dec     rsi
+    jnz     .b_row
+.b_exit:
+    add     rsp, 8
+    pop     r15
+    pop     r14
+    pop     r13
+    pop     r12
+    pop     rbp
+    pop     rbx
+    ret
+%endif ; !BARE_METAL
+
 %else
 %error "FAST_Q8=0 (FP32-activation path) is not ported to AVX1 / Ivy Bridge; build with FAST_Q8=1"
 %endif
@@ -511,4 +668,15 @@ alignb 64
 q8_xa:        resb Q8_MAX_K
 alignb 64
 q8_xs:        resb (Q8_MAX_K / 32) * 4
+%ifndef BARE_METAL
+alignb 64
+q8b_xq:       resb MAX_BATCH * XQ_STRIDE
+alignb 64
+q8b_xa:       resb MAX_BATCH * XQ_STRIDE
+alignb 64
+q8b_xs:       resb MAX_BATCH * XS_STRIDE
+g_mm_b:       resq 1
+g_mm_m4:      resq 1
+g_mm_xstride: resq 1
+%endif
 %endif
