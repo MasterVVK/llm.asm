@@ -21,7 +21,7 @@
 
         .text
         .global tp_init, tp_matmul, tp_attn, tp_n_threads, g_mm_delta, tp_n_little, tp_chunk_shift
-        .global tp_matmul_batch, tp_main_variant
+        .global tp_main_variant
         .global tp_kv_base, tp_pos, tp_scale, tp_gqa
         .global tp_for, tp_ab_b
 
@@ -242,8 +242,6 @@ tp_run_chunks:
         ldr     x2, [x19, #JOB_K]
         cmp     w7, #2
         b.eq    3f
-        cmp     w7, #3
-        b.eq    5f
         bl      matmul_q8_0_range
         b       1b
 3:      cbz     x21, 4f
@@ -251,15 +249,11 @@ tp_run_chunks:
         b       1b
 4:      bl      matmul_q8_0_4x4_nopf
         b       1b
-5:      cbz     x21, 6f
-        bl      matmul_q8_0_4x4b_pf
-        b       1b
-6:      bl      matmul_q8_0_4x4b_nopf
-        b       1b
 2:      mov     x0, x2                  // attention head
         bl      gqa_attn_head
         b       1b
-7:      mov     x0, x2                  // item job: fn(i), fn in JOB_W
+7:      mov     x0, x2                  // item job: fn(i, kernel variant)
+        mov     x1, x21
         ldr     x9, [x19, #JOB_W]
         blr     x9
         b       1b
@@ -361,74 +355,6 @@ tp_matmul:
         ldp     x29, x30, [sp], #48
         ret
 
-// void tp_matmul_batch(const void *W x0, const float *X x1, float *OUT x2,
-//                      uint64 M x3, uint64 K x4, uint64 B x5)
-// Batched prefill GEMM on the repacked weights; X token stride in g_mm_xstride.
-// X = NULL: the activations are already in the q8b slots (quantized by the
-// pool jobs of transformer_forward_batch).
-tp_matmul_batch:
-        stp     x29, x30, [sp, #-64]!
-        stp     x19, x20, [sp, #16]
-        stp     x21, x22, [sp, #32]
-        str     x23, [sp, #48]
-        mov     x19, x0
-        mov     x20, x2
-        mov     x21, x3
-        mov     x22, x4
-        mov     x23, x5
-        cbz     x1, 7f
-        mov     x0, x1
-        mov     x1, x4
-        mov     x2, x5
-        ADR_L   x3, g_mm_xstride
-        ldr     x3, [x3]
-        bl      quantize_x_batch
-7:      ADR_L   x0, g_mm_b
-        str     x23, [x0]
-        lsl     x1, x21, #2
-        ADR_L   x0, g_mm_m4
-        str     x1, [x0]
-        ADR_L   x5, g_mm_delta
-        ldr     x5, [x5]
-        add     x19, x19, x5            // repacked copy of the matrix
-        ADR_L   x0, tp_n_threads
-        ldr     x0, [x0]
-        cmp     x0, #1
-        b.gt    1f
-        mov     x0, x19
-        mov     x1, x20
-        mov     x2, x22
-        mov     x3, #0
-        mov     x4, x21
-        ADR_L   x6, tp_main_variant
-        ldr     x6, [x6]
-        cbz     x6, 3f
-        bl      matmul_q8_0_4x4b_pf
-        b       2f
-3:      bl      matmul_q8_0_4x4b_nopf
-        b       2f
-1:      ADR_L   x0, tp_job
-        mov     w1, #3
-        str     w1, [x0, #JOB_KIND]
-        str     x19, [x0, #JOB_W]
-        str     x20, [x0, #JOB_OUT]
-        str     x22, [x0, #JOB_K]
-        str     x21, [x0, #JOB_M]
-        ADR_L   x5, tp_chunk_shift
-        ldr     x5, [x5]
-        mov     x1, #1
-        lsl     x1, x1, x5
-        sub     x1, x1, #1
-        add     x1, x21, x1
-        lsr     x1, x1, x5
-        str     w1, [x0, #JOB_NCHUNKS]
-        bl      tp_dispatch
-2:      ldr     x23, [sp, #48]
-        ldp     x21, x22, [sp, #32]
-        ldp     x19, x20, [sp, #16]
-        ldp     x29, x30, [sp], #64
-        ret
-
 // void tp_attn(uint64 n_heads x0) — attention params are in tp_kv_base/tp_pos/tp_scale/tp_gqa
 tp_attn:
         stp     x29, x30, [sp, #-32]!
@@ -457,9 +383,11 @@ tp_attn:
         ldp     x29, x30, [sp], #32
         ret
 
-// void tp_for(void (*fn)(uint64) x0, uint64 n x1) — fn(i) for every i < n,
-// claimed dynamically by the pool; fn keeps x19-x28 like any AAPCS64 callee.
-// Used by the batched prefill for the attention items and per-token steps.
+// void tp_for(void (*fn)(uint64 i, uint64 variant) x0, uint64 n x1) — fn(i,
+// variant) for every i < n, claimed dynamically by the pool; variant is the
+// kernel variant of the calling thread (1 = prefetching A76 kernel). fn keeps
+// x19-x28 like any AAPCS64 callee. Every job of the batched prefill is such
+// an item job (transformer.s).
 tp_for:
         stp     x29, x30, [sp, #-48]!
         stp     x19, x20, [sp, #16]
@@ -474,6 +402,8 @@ tp_for:
 1:      cmp     x21, x20
         b.hs    3f
         mov     x0, x21
+        ADR_L   x1, tp_main_variant
+        ldr     x1, [x1]
         blr     x19
         add     x21, x21, #1
         b       1b
@@ -503,7 +433,7 @@ tp_kv_base: .skip 8
 tp_pos:     .skip 8
 tp_scale:   .skip 4
 tp_gqa:     .skip 4
-tp_ab_b:    .skip 8                     // tokens in the batch (batched attention)
+tp_ab_b:    .skip 8                     // tokens of the batched prefill pass
         .balign 8
 g_mm_delta: .skip 8                     // repacked_base - mmap_base (0 = row kernel)
 tp_main_variant: .skip 8

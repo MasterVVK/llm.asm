@@ -598,11 +598,41 @@ transformer_forward:
         ldp     x29, x30, [sp], #F_SIZE
         ret
 
-// Per-token steps of the batched prefill. transformer_forward_batch runs them
-// as pool jobs (tp_for) with one token per chunk (silu_item: a quarter of a
-// token). A chunk makes the same calls on the same data as the single-thread
-// loops they replace, so the results do not depend on the thread that takes
-// it. Layer parameters: fb_norm, fb_res, fb_qnorm, fb_knorm, tp_pos, tp_kv_base.
+// Pool items of the batched prefill (tp_for: x0 = item, x1 = kernel variant
+// of the calling core). qkv_item runs the batch kernel on the rows of one
+// head for all tokens and then QK-norm, RoPE and the KV cache copy of these
+// rows while they are still in the core's cache; mm_item is a plain chunk of
+// rows; norm_item and silu_item work on tokens. Every item makes the same
+// calls on the same data as the single-thread code, so the results do not
+// depend on the core that takes it. Parameters: fb_*, tp_pos, tp_kv_base,
+// tp_ab_b, and g_mm_b / g_mm_m4 (tokens, output token stride) for the kernel.
+// Fusing gate/up with SwiGLU and the projections with the residual add, as
+// the x86-64 build does, measured slower here (results/prefill-fused.txt).
+
+        .macro  PICK_KERNEL reg         // batch kernel for variant x1; clobbers x10
+        ADR_L   \reg, matmul_q8_0_4x4b_nopf
+        ADR_L   x10, matmul_q8_0_4x4b_pf
+        cmp     x1, #0
+        csel    \reg, \reg, x10, eq
+        .endm
+
+// fb_mm(W x0, out x1, M x2, K x3): matrix of the next matmul job
+fb_mm:
+        ADR_L   x9, g_mm_delta
+        ldr     x9, [x9]
+        add     x0, x0, x9              // repacked copy of the matrix
+        ADR_L   x9, fb_w
+        str     x0, [x9]
+        ADR_L   x9, fb_o
+        str     x1, [x9]
+        ADR_L   x9, fb_m
+        str     x2, [x9]
+        ADR_L   x9, fb_k
+        str     x3, [x9]
+        lsl     x2, x2, #2
+        ADR_L   x9, g_mm_m4
+        str     x2, [x9]
+        ret
 
 // void norm_item(uint64 t x0)
 // If fb_res: BX[t] += BXB[t] (residual of the projection that wrote BXB).
@@ -643,104 +673,125 @@ norm_item:
         ldp     x29, x30, [sp], #32
         ret
 
-// void qk_item(uint64 t x0)
-// QK-norm and RoPE of token t, then its K and V into the cache at pos0 + t.
-qk_item:
-        stp     x29, x30, [sp, #-64]!
+// void qkv_item(uint64 i x0, uint64 variant x1)
+// Rows of head i of the fused Q/K/V matrix (q heads, then k, then v) for all
+// tokens. Then per token t: q heads get QK-norm and RoPE; k heads QK-norm,
+// RoPE and the copy into the K cache at pos0 + t; v heads the copy into the
+// V cache.
+qkv_item:
+        stp     x29, x30, [sp, #-96]!
         stp     x19, x20, [sp, #16]
         stp     x21, x22, [sp, #32]
         stp     x23, x24, [sp, #48]
+        stp     x25, x26, [sp, #64]
+        str     x27, [sp, #80]
         ADR_L   x19, g_ctx
-        mov     x20, x0                 // t
+        mov     x20, x0                 // i
+        PICK_KERNEL x9
         ldr     x22, [x19, #CTX_HEAD_DIM]
-        ldr     x0, [x19, #CTX_Q_DIM]
-        ldr     x1, [x19, #CTX_KV_DIM]
-        add     x0, x0, x1, lsl #1      // floats per token in buf_bqkv
-        mul     x0, x0, x20
+        mul     x3, x20, x22            // first row of the head
         ldr     x1, [x19, #CTX_BUF_BQKV]
-        add     x21, x1, x0, lsl #2     // q of token t (k, v follow)
-        mov     x23, x21
-        ldr     x24, [x19, #CTX_N_HEADS]
-1:      mov     x0, x23
-        mov     x1, x23
+        add     x21, x1, x3, lsl #2     // x21 = its output for token 0
+        ADR_L   x0, fb_w
+        ldr     x0, [x0]
+        ldr     x2, [x19, #CTX_DIM]
+        add     x4, x3, x22
+        blr     x9
         ADR_L   x9, fb_qnorm
-        ldr     x2, [x9]
-        mov     x3, x22
-        ldr     s0, [x19, #CTX_RMS_EPS]
-        bl      rmsnorm
-        add     x23, x23, x22, lsl #2
-        subs    x24, x24, #1
-        b.ne    1b
-        ldr     x24, [x19, #CTX_N_KV_HEADS]
-2:      mov     x0, x23
-        mov     x1, x23
+        ldr     x23, [x9]               // x23 = QK-norm weights, 0 for v heads
+        mov     x24, #0                 // x24 = cache row of token 0, 0 for q heads
+        ldr     x0, [x19, #CTX_N_HEADS]
+        subs    x20, x20, x0
+        b.lo    3f
         ADR_L   x9, fb_knorm
-        ldr     x2, [x9]
+        ldr     x23, [x9]
+        ldr     x6, [x19, #CTX_BUF_K_CACHE]
+        ldr     x0, [x19, #CTX_N_KV_HEADS]
+        subs    x20, x20, x0
+        b.hs    1f
+        add     x20, x20, x0            // k head
+        b       2f
+1:      mov     x23, #0                 // v head
+        ldr     x6, [x19, #CTX_BUF_V_CACHE]
+2:      ldr     x0, [x19, #CTX_MAX_SEQ]
+        ADR_L   x9, tp_pos
+        ldr     x1, [x9]
+        madd    x20, x20, x0, x1        // kv head * max_seq + pos0
+        mul     x20, x20, x22
+        ADR_L   x9, tp_kv_base
+        ldr     x1, [x9]
+        add     x20, x1, x20, lsl #2
+        add     x24, x6, x20
+3:      mov     x20, #0                 // t
+        mov     x25, #0                 // RoPE table offset of token t
+        ADR_L   x9, tp_ab_b
+        ldr     x26, [x9]
+        ADR_L   x9, g_mm_m4
+        ldr     x27, [x9]               // token stride of the outputs
+4:      cmp     x20, x26
+        b.hs    9f
+        cbz     x23, 5f
+        mov     x0, x21
+        mov     x1, x21
+        mov     x2, x23
         mov     x3, x22
         ldr     s0, [x19, #CTX_RMS_EPS]
         bl      rmsnorm
-        add     x23, x23, x22, lsl #2
-        subs    x24, x24, #1
-        b.ne    2b
-        lsl     x23, x22, #1
-        mul     x23, x23, x20           // RoPE table offset of token t
         mov     x0, x21
         ldr     x1, [x19, #CTX_BUF_BCOS]
-        add     x1, x1, x23
+        add     x1, x1, x25
         ldr     x2, [x19, #CTX_BUF_BSIN]
-        add     x2, x2, x23
-        ldr     x3, [x19, #CTX_N_HEADS]
+        add     x2, x2, x25
+        mov     x3, #1
         mov     x4, x22
         bl      rope_apply
-        ldr     x0, [x19, #CTX_Q_DIM]
-        add     x0, x21, x0, lsl #2
-        ldr     x1, [x19, #CTX_BUF_BCOS]
-        add     x1, x1, x23
-        ldr     x2, [x19, #CTX_BUF_BSIN]
-        add     x2, x2, x23
-        ldr     x3, [x19, #CTX_N_KV_HEADS]
-        mov     x4, x22
-        bl      rope_apply
-        ldr     x0, [x19, #CTX_MAX_SEQ]
-        lsl     x3, x22, #2             // head_bytes
-        mul     x4, x0, x3              // kv_head_stride
-        ADR_L   x9, tp_kv_base
-        ldr     x2, [x9]
-        ADR_L   x9, tp_pos
-        ldr     x5, [x9]
-        add     x5, x5, x20
-        madd    x5, x5, x3, x2
-        ldr     x6, [x19, #CTX_BUF_K_CACHE]
-        add     x6, x6, x5
-        ldr     x7, [x19, #CTX_BUF_V_CACHE]
-        add     x7, x7, x5
-        ldr     x0, [x19, #CTX_Q_DIM]
-        add     x10, x21, x0, lsl #2    // k_t
-        ldr     x0, [x19, #CTX_KV_DIM]
-        add     x11, x10, x0, lsl #2    // v_t
-        ldr     x12, [x19, #CTX_N_KV_HEADS]
-3:      mov     x13, #0
-4:      add     x14, x10, x13
+5:      cbz     x24, 7f
+        lsl     x3, x22, #2             // head bytes
+        mov     x13, #0
+6:      add     x14, x21, x13
         ldp     q0, q1, [x14]
-        add     x14, x11, x13
-        ldp     q2, q3, [x14]
-        add     x14, x6, x13
+        add     x14, x24, x13
         stp     q0, q1, [x14]
-        add     x14, x7, x13
-        stp     q2, q3, [x14]
         add     x13, x13, #32
         cmp     x13, x3
-        b.lo    4b
-        add     x10, x10, x3
-        add     x11, x11, x3
-        add     x6, x6, x4
-        add     x7, x7, x4
-        subs    x12, x12, #1
-        b.ne    3b
+        b.lo    6b
+        add     x24, x24, x3
+7:      add     x21, x21, x27
+        add     x25, x25, x22, lsl #1
+        add     x20, x20, #1
+        b       4b
+9:      ldr     x27, [sp, #80]
+        ldp     x25, x26, [sp, #64]
         ldp     x23, x24, [sp, #48]
         ldp     x21, x22, [sp, #32]
         ldp     x19, x20, [sp, #16]
-        ldp     x29, x30, [sp], #64
+        ldp     x29, x30, [sp], #96
+        ret
+
+// void mm_item(uint64 i x0, uint64 variant x1)
+// Rows of chunk i (2^tp_chunk_shift rows) of the matrix fb_w (fb_m rows,
+// K = fb_k) for all tokens into fb_o.
+mm_item:
+        stp     x29, x30, [sp, #-16]!
+        PICK_KERNEL x9
+        ADR_L   x10, tp_chunk_shift
+        ldr     x10, [x10]
+        lsl     x3, x0, x10             // r0
+        mov     x4, #1
+        lsl     x4, x4, x10
+        add     x4, x3, x4
+        ADR_L   x11, fb_m
+        ldr     x11, [x11]
+        cmp     x4, x11
+        csel    x4, x4, x11, lo         // r1 = min(r0 + rows, M)
+        ADR_L   x0, fb_w
+        ldr     x0, [x0]
+        ADR_L   x1, fb_o
+        ldr     x1, [x1]
+        ADR_L   x2, fb_k
+        ldr     x2, [x2]
+        blr     x9
+        ldp     x29, x30, [sp], #16
         ret
 
 // void silu_item(uint64 i x0)
@@ -788,12 +839,12 @@ silu_item:
 // void transformer_forward_batch(const uint32 *toks x0, uint64 B x1, uint64 pos0 x2,
 //                                int compute_logits x3)
 // Prompt prefill of B <= MAX_BATCH tokens at pos0 .. pos0 + B - 1: weights are
-// streamed once per layer for the batch (tp_matmul_batch), the attention of all
-// tokens is one pool job (attn_pair_item), and token t attends to 0 .. pos0 + t
-// after the whole batch is in the KV cache. Between the matmuls, residual adds,
-// RMSNorm, activation quantization, QK-norm, RoPE, the KV copy and SwiGLU run
-// as pool jobs over the tokens (norm_item, qk_item, silu_item) with the
-// single-token code. Bit-identical to B transformer_forward calls.
+// streamed once per layer for the batch in pool jobs (mm_item; qkv_item also
+// runs QK-norm, RoPE and the KV copy of its head), residual adds, RMSNorm,
+// quantization and SwiGLU are pool jobs over the tokens (norm_item,
+// silu_item), the attention of all tokens is one pool job (attn_pair_item),
+// and token t attends to 0 .. pos0 + t after the whole batch is in the KV
+// cache. Bit-identical to B transformer_forward calls.
         .equ FB_TOKS,     96
         .equ FB_POS0,     104
         .equ FB_LOGITS,   112
@@ -809,7 +860,9 @@ silu_item:
         .equ FB_SAVE_Q,   192
         .equ FB_SAVE_ATT, 200
         .equ FB_PAIR,     208             // 1 = batched attention kernel applies
-        .equ FB_SZ,       224
+        .equ FB_DIM_N,    216             // mm_item chunks of a dim-row matrix
+        .equ FB_GU_N,     224             // mm_item chunks of gate + up
+        .equ FB_SZ,       240
 transformer_forward_batch:
         stp     x29, x30, [sp, #-FB_SZ]!
         stp     x19, x20, [sp, #16]
@@ -872,7 +925,23 @@ transformer_forward_batch:
         bl      compute_rope_cs
         add     x23, x23, #1
         b       1b
-2:      mov     x24, #0                 // layer
+2:      ADR_L   x9, g_mm_b              // tokens for the kernel and the items
+        str     x20, [x9]
+        ADR_L   x9, tp_ab_b
+        str     x20, [x9]
+        ADR_L   x9, tp_chunk_shift      // mm_item chunks: ceil(M / rows)
+        ldr     x9, [x9]
+        mov     x10, #1
+        lsl     x10, x10, x9
+        sub     x10, x10, #1
+        add     x11, x21, x10
+        lsr     x11, x11, x9
+        str     x11, [sp, #FB_DIM_N]
+        ldr     x11, [x19, #CTX_HIDDEN_DIM]
+        add     x11, x10, x11, lsl #1
+        lsr     x11, x11, x9
+        str     x11, [sp, #FB_GU_N]
+        mov     x24, #0                 // layer
 .Lfb_layer:
         ldr     x0, [x19, #CTX_N_LAYERS]
         cmp     x24, x0
@@ -923,14 +992,12 @@ transformer_forward_batch:
         ADR_L   x0, norm_item
         mov     x1, x20
         bl      tp_for
-        ldr     x0, [sp, #FB_QKV]       // fused Q + K + V for the batch
-        mov     x1, #0                  // quantized by norm_item
-        ldr     x2, [x19, #CTX_BUF_BQKV]
-        ldr     x3, [sp, #FB_QKVM]
-        mov     x4, x21
-        mov     x5, x20
-        bl      tp_matmul_batch
-        // QK-norm, RoPE, K/V into the cache at pos0 + t
+        // Q, K, V by heads with QK-norm, RoPE and the KV cache at pos0 + t
+        ldr     x0, [sp, #FB_QKV]
+        ldr     x1, [x19, #CTX_BUF_BQKV]
+        ldr     x2, [sp, #FB_QKVM]
+        mov     x3, x21
+        bl      fb_mm
         ldr     x0, [sp, #FB_Q_NORM]
         ADR_L   x9, fb_qnorm
         str     x0, [x9]
@@ -940,21 +1007,20 @@ transformer_forward_batch:
         ldr     x0, [sp, #FB_POS0]
         ADR_L   x9, tp_pos
         str     x0, [x9]
-        ADR_L   x0, qk_item
-        mov     x1, x20
+        ADR_L   x0, qkv_item
+        ldr     x1, [x19, #CTX_N_KV_HEADS]
+        ldr     x2, [x19, #CTX_N_HEADS]
+        add     x1, x2, x1, lsl #1
         bl      tp_for
         // attention of the whole batch in one pool job: a chunk is a pair of
         // query heads of one token (its outputs come back quantized)
         ldr     x0, [sp, #FB_PAIR]
         cbz     x0, 80f
-        ADR_L   x9, tp_ab_b
-        str     x20, [x9]
         ADR_L   x0, attn_pair_item
         ldr     x1, [x19, #CTX_N_HEADS]
         lsr     x1, x1, #1              // head pairs
         mul     x1, x1, x20
         bl      tp_for
-        mov     x1, #0                  // quantized by attn_pair_item
         b       81f
 80:     // otherwise per token: point buf_q / buf_att_out at token t (no copies)
         ldr     x0, [x19, #CTX_BUF_Q]
@@ -988,17 +1054,19 @@ transformer_forward_batch:
         str     x0, [x19, #CTX_BUF_Q]
         ldr     x0, [sp, #FB_SAVE_ATT]
         str     x0, [x19, #CTX_BUF_ATT_OUT]
-        ldr     x0, [x19, #CTX_Q_DIM]
-        lsl     x0, x0, #2
-        ADR_L   x1, g_mm_xstride
-        str     x0, [x1]
-        ldr     x1, [x19, #CTX_BUF_BATT] // tp_matmul_batch quantizes it
+        ldr     x0, [x19, #CTX_BUF_BATT] // outputs into the q8b slots
+        ldr     x1, [x19, #CTX_Q_DIM]
+        mov     x2, x20
+        lsl     x3, x1, #2
+        bl      quantize_x_batch
 81:     ldr     x0, [sp, #FB_O]         // output projection for the batch
-        ldr     x2, [x19, #CTX_BUF_BXB]
-        mov     x3, x21
-        ldr     x4, [x19, #CTX_Q_DIM]
-        mov     x5, x20
-        bl      tp_matmul_batch
+        ldr     x1, [x19, #CTX_BUF_BXB]
+        mov     x2, x21
+        ldr     x3, [x19, #CTX_Q_DIM]
+        bl      fb_mm
+        ADR_L   x0, mm_item
+        ldr     x1, [sp, #FB_DIM_N]
+        bl      tp_for
         // residual, post-attention RMSNorm and quantization
         ldr     x0, [sp, #FB_POST_NORM]
         ADR_L   x9, fb_norm
@@ -1010,23 +1078,25 @@ transformer_forward_batch:
         mov     x1, x20
         bl      tp_for
         ldr     x0, [sp, #FB_GU]        // fused gate + up for the batch
-        mov     x1, #0                  // quantized by norm_item
-        ldr     x2, [x19, #CTX_BUF_BGU]
-        ldr     x3, [x19, #CTX_HIDDEN_DIM]
-        lsl     x3, x3, #1
-        mov     x4, x21
-        mov     x5, x20
-        bl      tp_matmul_batch
+        ldr     x1, [x19, #CTX_BUF_BGU]
+        ldr     x2, [x19, #CTX_HIDDEN_DIM]
+        lsl     x2, x2, #1
+        mov     x3, x21
+        bl      fb_mm
+        ADR_L   x0, mm_item
+        ldr     x1, [sp, #FB_GU_N]
+        bl      tp_for
         ADR_L   x0, silu_item           // SwiGLU, a quarter of a token per chunk
         lsl     x1, x20, #2
         bl      tp_for
         ldr     x0, [sp, #FB_DOWN]      // down projection (input: gate half); the
-        mov     x1, #0                  // next layer's norm_item adds the residual
-        ldr     x2, [x19, #CTX_BUF_BXB]
-        mov     x3, x21
-        ldr     x4, [x19, #CTX_HIDDEN_DIM]
-        mov     x5, x20
-        bl      tp_matmul_batch
+        ldr     x1, [x19, #CTX_BUF_BXB] // next layer's norm_item adds the residual
+        mov     x2, x21
+        ldr     x3, [x19, #CTX_HIDDEN_DIM]
+        bl      fb_mm
+        ADR_L   x0, mm_item
+        ldr     x1, [sp, #FB_DIM_N]
+        bl      tp_for
         add     x24, x24, #1
         b       .Lfb_layer
 .Lfb_layers_done:
@@ -1378,5 +1448,9 @@ g_ctx:  .skip   CTX_SIZE
         .balign 8
 fb_norm:  .skip 8                       // RMSNorm weights of norm_item
 fb_res:   .skip 8                       // 1 = norm_item adds the residual first
-fb_qnorm: .skip 8                       // QK-norm weights of qk_item
+fb_qnorm: .skip 8                       // QK-norm weights of qkv_item
 fb_knorm: .skip 8
+fb_w:     .skip 8                       // repacked weights of the matmul items
+fb_o:     .skip 8                       // output of mm_item
+fb_m:     .skip 8                       // rows of the matrix
+fb_k:     .skip 8                       // K of the matrix

@@ -43,7 +43,7 @@ Prefill with DDR fixed, tokens per second: this port 26.8 / 37.8 / 44.6 on 1 / 2
 - **Little cores.** llama.cpp is 1.3–1.6× faster on A55 with DDR fixed.
 - **DDR frequency.** With the default governor, work on A55 cores alone keeps the memory at 534 MHz, while any A76 at work raises it to 2400 MHz. A55-only workloads are therefore memory-starved by default: on one A55 this port gains 49% when DDR is fixed.
 - **Mixing.** Adding A55 cores to the four A76 slows both engines down, because memory bandwidth is already saturated. Use the 4 big cores: with all cores allowed, `-t 4` picks the A76 automatically.
-- **Prefill** is batched, with a register-tiled matrix kernel, one attention job per layer and the per-token steps spread over the threads: on 4×A76 this port is 2% faster than llama.cpp on a 227-token prompt; elsewhere llama.cpp is 1.04–1.31× faster (it was 2.3–5× with token-by-token prefill).
+- **Prefill** is batched, with a register-tiled matrix kernel, one attention job per layer and the per-token steps spread over the threads: on 4×A76 this port is 10% faster than llama.cpp on a 227-token prompt (226 vs 206 tok/s); elsewhere llama.cpp is 1.03–1.29× faster (it was 2.3–5× with token-by-token prefill).
 
 ## Ollama and two OSes at once
 
@@ -88,19 +88,19 @@ Kernel alone, data in L1 (`aarch64/kbench.s`), cycles per row, token and 32-valu
 
 Attention of a pass is one pool job per layer: a chunk is two query heads of one token, which read the same kv head. Scores are computed for 2 heads × 2 positions at once in 16 accumulators that keep the layout and reduction order of the single-token dot product, so every q and K load serves two products. Each 32-value output block of both heads stays in registers over all positions instead of a load and a store of the output per position. The chunks of one head pair follow each other, so its K and V rows stay in the 512 KB L2 of the core from token to token; in token-major order the same kernel gained nothing on one A76. The logits stay bit-identical.
 
-Between the matrix passes, residual adds, RMSNorm, activation quantization, QK-norm, RoPE, the KV copy and SwiGLU run as pool jobs too, with one token per chunk (SwiGLU: a quarter of a token), and the attention job quantizes its own outputs for the output projection. Each chunk runs the single-token code, so the logits stay bit-identical.
+Between the matrix passes, residual adds, RMSNorm, activation quantization and SwiGLU run as pool jobs, with one token per chunk (SwiGLU: a quarter of a token), and the attention job quantizes its own outputs. QK-norm, RoPE and the KV copy run inside the Q/K/V pass: a chunk is one head for all tokens, and the core applies these steps to the rows it has just computed. Each step runs the single-token code, so the logits stay bit-identical. Running SwiGLU inside the gate/up pass and the residual add inside the projections, as tried on x86-64, measured slower on these cores (`results/prefill-fused.txt`).
 
-Prefill, Qwen3-0.6B, tokens per second (3 runs, each started below 65 °C; llama.cpp as above, `llama-bench -p 34,227`; `results/prefill-tiles.txt`, `results/prefill-attention.txt`, `results/prefill-steps.txt`):
+Prefill, Qwen3-0.6B, tokens per second (3 runs, each started below 65 °C; llama.cpp as above, `llama-bench -p 34,227`; `results/prefill-tiles.txt`, `results/prefill-attention.txt`, `results/prefill-steps.txt`, `results/prefill-fused.txt`):
 
 | Cores | 34 tokens: token by token | 34 tokens: batched | 34 tokens: llama.cpp | 227 tokens: batched | 227 tokens: llama.cpp |
 |---|---:|---:|---:|---:|---:|
-| 4×A76 | 45 | 179–190 | 213 | 210–220 | 206 |
-| 1×A76 | 27 | 55–61 | 60 | 53–54 | 57 |
-| 4×A55 | 13 | 40–41 | 53 | 41–42 | 52 |
+| 4×A76 | 45 | 187–201 | 213 | 214–226 | 206 |
+| 1×A76 | 27 | 57–58 | 60 | 52–54 | 57 |
+| 4×A55 | 13 | 40–41 | 53 | 41.6–42.4 | 52 |
 
-Against the previous version in alternating runs, the per-token steps in the pool add 9% on 4×A76 (194 → 211 tok/s) and 7% on 4×A55 (39.0 → 41.8) on the 227-token prompt, 6% and 3% on the 34-token one; one A76 is unchanged within 1%. Batched attention before them added 8–11% on the 227-token prompt (4×A76: 179 → 202 tok/s). The first batched version (one 4-row group and one token at a time) reached 150 / 47 / 29.5 tok/s on the 34-token prompt and 157 / 43 / 27.8 on the 227-token one.
+Against the previous version in alternating runs, QK-norm, RoPE and the KV copy inside the Q/K/V pass add 7% on 4×A76 on the 34-token prompt (182 → 195 tok/s) and 2% on the 227-token one (221 → 226); one A76 and 4×A55 stay within −1…+4%. The per-token steps in the pool before that added 9% on 4×A76 and 7% on 4×A55 on the 227-token prompt, and batched attention 8–11%. The first batched version (one 4-row group and one token at a time) reached 150 / 47 / 29.5 tok/s on the 34-token prompt and 157 / 43 / 27.8 on the 227-token one.
 
-What is left, 227-token prompt: attention takes 0.44 s of 4.3 s on 1×A76 (0.83 s before batched attention): about 0.13 s for the scores, 0.06 s for softmax and 0.25 s for the weighted sum of V, half of which waits for V rows from L2. On 4×A76 it takes about 0.15 s of 1.07 s. The per-token steps take 0.11 s of 1.07 s on 4×A76 (0.20 s on one thread before) and 0.38 s of 5.4 s on 4×A55 (0.82 s). On four A76 they take about as long as on one, which points to moving token rows between cores: the matmul writes every token row from all cores, and a step reads it whole on one.
+What is left, 227-token prompt: attention takes 0.44 s of 4.3 s on 1×A76 (0.83 s before batched attention): about 0.13 s for the scores, 0.06 s for softmax and 0.25 s for the weighted sum of V, half of which waits for V rows from L2. On 4×A76 it takes about 0.15 s of the 1.0 s. Before the Q/K/V fusion the per-token steps took 0.11 s of 1.07 s on 4×A76 (0.20 s on one thread before that) and 0.38 s of 5.4 s on 4×A55 (0.82 s); on four A76 about as long as on one, which points to moving token rows between cores. The fusion removes that move for QK-norm, RoPE and the KV copy; fusing gate/up and the residual the same way did not pay off here.
 
 ## Build and run
 

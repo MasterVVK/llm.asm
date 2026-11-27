@@ -18,7 +18,7 @@
         .global dot_f32, saxpy_f32, q8_xq, q8_xs
         .global repack_q8_0_4x4, matmul_q8_0_4x4_pf, matmul_q8_0_4x4_nopf
         .global quantize_x_batch, quantize_x_slot, matmul_q8_0_4x4b_pf, matmul_q8_0_4x4b_nopf
-        .global g_mm_b, g_mm_m4, g_mm_xstride
+        .global g_mm_b, g_mm_m4
 
 // void quantize_x_q8_0(const float *x x0, uint64 K x1)
 // q8_xs[b] = max|x| / 127, q8_xq = round-half-even(x * 127 / max|x|) in [-127, 127]
@@ -623,4 +623,3 @@ q8b_xs: .skip   MAX_BATCH * XS_STRIDE
         .balign 8
 g_mm_b: .skip   8
 g_mm_m4: .skip  8
-g_mm_xstride: .skip 8

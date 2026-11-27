@@ -1,0 +1,50 @@
+# QK-norm, RoPE and the KV copy inside the Q/K/V pass of the batched prefill,
+# Qwen3-0.6B Q8_0, CM3588 (RK3588), default DDR governor (aarch64/transformer.s:
+# qkv_item computes the rows of one head for all tokens, then these steps on
+# them). The other passes are plain row chunks (mm_item); residual adds,
+# RMSNorm, quantization and SwiGLU stay pool jobs per token. Logits are
+# bit-identical to the previous version and to --batch 1 on every core set
+# (34-token prompt: 98b4171a162a99e8e69ac21845bd8001, 227-token prompt:
+# 04e94def44b5db53ae0c2a45cd0f75f3), also with the per-token attention path
+# forced.
+
+# Previous version (d3e05e8) and this one run alternately, every run started
+# below 65 C. Tokens per second, 3 runs each; --batch 16 (default).
+cores   prompt  previous              qkv_fused
+4xA76   34      181.96 181.99 190.97  187.39 200.53 194.53
+4xA76   227     221.79 219.80 221.11  225.93 225.90 214.44
+1xA76   34      58.50 52.52 55.77     57.98 57.19 58.40
+1xA76   227     52.82 53.09 53.12     52.60 53.58 51.91
+4xA55   34      41.04 41.01 39.86     41.20 41.11 39.88
+4xA55   227     41.75 41.27 41.97     41.58 42.35 42.34
+
+# Which steps to fuse: an earlier series with test builds of the same items
+# (prev = d3e05e8; fused = Q/K/V plus gate/up with SwiGLU plus the residual in
+# the projection chunks, as tried on x86-64; gu16 = without the gate/up
+# fusion; res0 = without the residual fusion; both = without either, the
+# layout used here). Tokens per second, round 1 (3 runs) / round 2 (5 runs,
+# 3 on 1xA76); both was only built for round 2. The lab Ollama server started
+# during round 2 and its 4xA55 part was not run.
+4xA76 227  prev   220.32 210.64 209.16 / 210.97 221.32 218.96 209.22 217.35
+           fused  214.16 213.17 224.30 / 223.73 222.59 223.56 213.96 213.14
+           gu16   214.43 213.97 214.54 / 223.81 222.32 221.73 214.61 213.21
+           res0   223.93 215.49 226.13 / 223.96 225.26 223.01 224.61 224.97
+           both   224.94 216.19 224.19 216.52 225.62
+4xA76 34   prev   198.51 174.20 187.54 / 179.86 183.63 182.07 196.46 174.99
+           fused  189.75 191.30 186.23 / 194.62 189.00 194.05 202.05 186.40
+           gu16   190.34 187.33 185.03 / 190.97 183.19 201.96 200.11 189.76
+           res0   186.87 195.22 187.63 / 192.41 191.45 185.23 198.88 200.23
+           both   200.68 202.63 192.94 201.66 196.26
+1xA76 227  prev   53.33 52.81 53.10 / 52.74 53.09 52.81
+           fused  51.91 52.73 52.19 / 51.97 52.13 52.36
+           gu16   51.99 52.95 52.30 / 53.67 52.46 52.69
+           res0   52.95 52.52 52.67 / 52.71 52.36 52.22
+           both   53.80 52.87 52.79
+4xA55 227  prev   41.80 41.71 41.98
+           fused  41.96 42.41 42.09
+           gu16   42.46 42.13 42.56
+           res0   42.33 41.91 42.47
+# The Q/K/V fusion gives the gain. Fusing gate/up gives nothing on the A76 and
+# costs a little on one A76; the residual inside the projections does not pay
+# either. On 4xA76 the 227-token runs fall into a slow (~213) and a fast
+# (~223) mode, so single medians of 3 runs move by a few percent.
