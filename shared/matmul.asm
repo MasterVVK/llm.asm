@@ -54,6 +54,7 @@ global matmul_set_fp16
 global quantize_x_q8_0
 %ifndef BARE_METAL
 global quantize_x_batch
+global quantize_x_slot
 global matmul_q8_0_batch_range
 global g_mm_b
 global g_mm_m4
@@ -475,6 +476,26 @@ quantize_x_batch:
     pop     r12
     pop     rbx
     ret
+
+; ----------------------------------------------------------------------------
+; void quantize_x_slot(const float *x, uint64 n, uint64 t, uint64 k0)
+; Quantizes x[0..n) into elements k0 .. k0 + n - 1 of the q8b slot of token t
+; (k0 and n multiples of 32). Blocks are independent, so a token quantized in
+; parts gets the same bytes as quantize_x_batch. Clobbers rax, rcx, rdx,
+; r8-r11 and SIMD registers.
+; ----------------------------------------------------------------------------
+quantize_x_slot:
+    imul    rax, rdx, XQ_STRIDE
+    lea     r9, [rel q8b_xq]
+    add     r9, rax
+    add     r9, rcx                     ; int8 of element k0
+    imul    rax, rdx, XS_STRIDE
+    lea     r10, [rel q8b_xs]
+    add     r10, rax
+    shr     rcx, 3                      ; scale of block k0 / 32
+    add     r10, rcx
+    xor     r11d, r11d                  ; no |x| slot
+    jmp     quantize_core
 
 ; ----------------------------------------------------------------------------
 ; Batched prefill GEMM with a 1 row x 2 token register tile (v2 fp16 scales).
