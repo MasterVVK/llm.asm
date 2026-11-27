@@ -1,0 +1,16 @@
+config,cpus,threads,engine,prefill_tok_s,decode_tok_s,max_temp_c
+A76x1,4,1,llm-asm,26.18,19.46,74
+A76x1,4,1,llama.cpp,56.45,23.02,73
+A76x1,4,1,ollama,335.49,21.97,74
+A76x4,4-7,4,llm-asm,44.66,34.22,80
+A76x4,4-7,4,llama.cpp,211.45,29.83,77
+A76x4,4-7,4,ollama,385.65,28.96,80
+A55x1,0,1,llm-asm,4.07,2.98,70
+A55x1,0,1,llama.cpp,13.59,4.89,68
+A55x1,0,1,ollama,153.41,4.39,68
+A55x4,0-3,4,llm-asm,13.17,10.27,70
+A55x4,0-3,4,llama.cpp,52.04,15.75,70
+A55x4,0-3,4,ollama,303.13,13.33,71
+all8,0-7,8,llm-asm,36.98,27.95,76
+all8,0-7,8,llama.cpp,151.06,22.93,77
+all8,0-7,8,ollama,398.05,22.17,79

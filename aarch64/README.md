@@ -45,6 +45,29 @@ Prefill with DDR fixed, tokens per second: this port 26.8 / 37.8 / 44.6 on 1 / 2
 - **Mixing.** Adding A55 cores to the four A76 slows both engines down, because memory bandwidth is already saturated. Use the 4 big cores: with all cores allowed, `-t 4` picks the A76 automatically.
 - **Prefill** is 2.3–5× slower than llama.cpp, because this engine processes the prompt token by token.
 
+## Ollama and two OSes at once
+
+Ollama 0.32.5 got the same Q8_0 GGUF in a private instance; its speed is taken from its own `eval_count` / `eval_duration`. On the host, decode in tokens per second, with the SoC cooled below 70 °C before every measurement (`results/three-engines-host.csv`):
+
+| Cores | This port | llama.cpp | Ollama |
+|---|---:|---:|---:|
+| 1×A76 | 19.5 | 23.0 | 22.0 |
+| 4×A76 | **34.2** | 29.8 | 29.0 |
+| 1×A55 | 3.0 | 4.9 | 4.4 |
+| 4×A55 | 10.3 | 15.8 | 13.3 |
+| all 8 | 28.0 | 22.9 | 22.2 |
+
+Two KVM guests at once (QEMU in Docker, a minimal Linux initramfs in each), one pinned to the four A76 and one to the four A55 (`vm/`, `results/vm/`). Median decode, tokens per second:
+
+| | A76 guest | A55 guest | Sum |
+|---|---:|---:|---:|
+| This port, each guest alone | 34.2 | 10.0 | — |
+| This port, both at once | 21.7 | 6.0 | 27.7 |
+| Ollama, each guest alone | 28.0 | 12.7 | — |
+| Ollama, both at once | 18.8 | 7.4 | 26.2 |
+
+Both guests together deliver less than the A76 guest alone. Within seconds the A76 guest drops from 30 to 22 tok/s while still at full clock, because the clusters share DDR and the L3. Within a minute the SoC reaches 85 °C and throttles the A76 to 1.8–2.0 GHz and the A55 to 1.2 GHz. KVM itself costs almost nothing: 34.2 tok/s in the guest, 34.3 on the host.
+
 ## Build and run
 
 ```bash

@@ -1,0 +1,22 @@
+[A55] guest up at 1.63s: 4 vCPU, CPU part 0xd05
+[A55] ollama ready at 19.65s
+[A55] run 1 at 19s: eval_count=64 eval_duration_ns=5030515000
+[A55] run 2 at 26s: eval_count=64 eval_duration_ns=5138894000
+[A55] run 3 at 33s: eval_count=64 eval_duration_ns=4977730000
+[A55] run 4 at 39s: eval_count=64 eval_duration_ns=4933951000
+[A55] run 5 at 46s: eval_count=64 eval_duration_ns=4941728000
+[A55] run 6 at 52s: eval_count=64 eval_duration_ns=5184502000
+[A55] run 7 at 59s: eval_count=64 eval_duration_ns=5011792000
+[A55] run 8 at 66s: eval_count=64 eval_duration_ns=4965753000
+[A55] run 9 at 72s: eval_count=64 eval_duration_ns=5029294000
+[A55] run 10 at 79s: eval_count=64 eval_duration_ns=5080913000
+[A55] run 11 at 86s: eval_count=64 eval_duration_ns=4971144000
+[A55] run 12 at 92s: eval_count=64 eval_duration_ns=5049024000
+[A55] run 13 at 99s: eval_count=64 eval_duration_ns=5032128000
+[A55] run 14 at 106s: eval_count=64 eval_duration_ns=5063457000
+[A55] run 15 at 112s: eval_count=64 eval_duration_ns=4965083000
+[A55] run 16 at 119s: eval_count=64 eval_duration_ns=5200241000
+[A55] run 17 at 126s: eval_count=64 eval_duration_ns=5103032000
+[A55] run 18 at 132s: eval_count=64 eval_duration_ns=5251271000
+[A55] run 19 at 139s: eval_count=64 eval_duration_ns=4944082000
+[A55] done at 146.21s

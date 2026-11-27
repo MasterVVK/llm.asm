@@ -1,0 +1,39 @@
+[A76] guest up at 0.84s: 4 vCPU, CPU part 0xd0b
+[A76] ollama ready at 8.61s
+[A76] run 1 at 8s: eval_count=64 eval_duration_ns=2456064000
+[A76] run 2 at 11s: eval_count=64 eval_duration_ns=2434561000
+[A76] run 3 at 14s: eval_count=64 eval_duration_ns=2902904000
+[A76] run 4 at 18s: eval_count=64 eval_duration_ns=3237779000
+[A76] run 5 at 22s: eval_count=64 eval_duration_ns=3306469000
+[A76] run 6 at 25s: eval_count=64 eval_duration_ns=3012589000
+[A76] run 7 at 29s: eval_count=64 eval_duration_ns=3502021000
+[A76] run 8 at 33s: eval_count=64 eval_duration_ns=2710775000
+[A76] run 9 at 36s: eval_count=64 eval_duration_ns=3409033000
+[A76] run 10 at 40s: eval_count=64 eval_duration_ns=3264379000
+[A76] run 11 at 44s: eval_count=64 eval_duration_ns=2666502000
+[A76] run 12 at 47s: eval_count=64 eval_duration_ns=3372557000
+[A76] run 13 at 51s: eval_count=64 eval_duration_ns=3170164000
+[A76] run 14 at 55s: eval_count=64 eval_duration_ns=3103204000
+[A76] run 15 at 59s: eval_count=64 eval_duration_ns=3543058000
+[A76] run 16 at 63s: eval_count=64 eval_duration_ns=2919860000
+[A76] run 17 at 67s: eval_count=64 eval_duration_ns=3498820000
+[A76] run 18 at 71s: eval_count=64 eval_duration_ns=3589747000
+[A76] run 19 at 75s: eval_count=64 eval_duration_ns=2903471000
+[A76] run 20 at 78s: eval_count=64 eval_duration_ns=3423697000
+[A76] run 21 at 82s: eval_count=64 eval_duration_ns=3370694000
+[A76] run 22 at 86s: eval_count=64 eval_duration_ns=3097001000
+[A76] run 23 at 90s: eval_count=64 eval_duration_ns=3825504000
+[A76] run 24 at 94s: eval_count=64 eval_duration_ns=3446485000
+[A76] run 25 at 98s: eval_count=64 eval_duration_ns=3893042000
+[A76] run 26 at 103s: eval_count=64 eval_duration_ns=3761084000
+[A76] run 27 at 107s: eval_count=64 eval_duration_ns=3474116000
+[A76] run 28 at 111s: eval_count=64 eval_duration_ns=3928349000
+[A76] run 29 at 116s: eval_count=64 eval_duration_ns=3507712000
+[A76] run 30 at 120s: eval_count=64 eval_duration_ns=3904970000
+[A76] run 31 at 125s: eval_count=64 eval_duration_ns=3910788000
+[A76] run 32 at 129s: eval_count=64 eval_duration_ns=3102682000
+[A76] run 33 at 133s: eval_count=64 eval_duration_ns=3991035000
+[A76] run 34 at 138s: eval_count=64 eval_duration_ns=3987443000
+[A76] run 35 at 142s: eval_count=64 eval_duration_ns=3393123000
+[A76] run 36 at 146s: eval_count=64 eval_duration_ns=4105733000
+[A76] done at 151.65s

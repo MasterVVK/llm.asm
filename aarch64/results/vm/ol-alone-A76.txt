@@ -1,0 +1,24 @@
+[A76] guest up at 0.79s: 4 vCPU, CPU part 0xd0b
+[A76] ollama ready at 8.12s
+[A76] run 1 at 8s: eval_count=64 eval_duration_ns=2351323000
+[A76] run 2 at 11s: eval_count=64 eval_duration_ns=2245832000
+[A76] run 3 at 14s: eval_count=64 eval_duration_ns=2286157000
+[A76] run 4 at 16s: eval_count=64 eval_duration_ns=2241833000
+[A76] run 5 at 19s: eval_count=64 eval_duration_ns=2355502000
+[A76] run 6 at 22s: eval_count=64 eval_duration_ns=2366906000
+[A76] run 7 at 25s: eval_count=64 eval_duration_ns=2243065000
+[A76] run 8 at 28s: eval_count=64 eval_duration_ns=2375337000
+[A76] run 9 at 31s: eval_count=64 eval_duration_ns=2371430000
+[A76] run 10 at 34s: eval_count=64 eval_duration_ns=2349824000
+[A76] run 11 at 37s: eval_count=64 eval_duration_ns=2394646000
+[A76] run 12 at 40s: eval_count=64 eval_duration_ns=2251313000
+[A76] run 13 at 43s: eval_count=64 eval_duration_ns=2267401000
+[A76] run 14 at 46s: eval_count=64 eval_duration_ns=2224885000
+[A76] run 15 at 49s: eval_count=64 eval_duration_ns=2238198000
+[A76] run 16 at 52s: eval_count=64 eval_duration_ns=2305728000
+[A76] run 17 at 55s: eval_count=64 eval_duration_ns=2402949000
+[A76] run 18 at 58s: eval_count=64 eval_duration_ns=2249532000
+[A76] run 19 at 61s: eval_count=64 eval_duration_ns=2422625000
+[A76] run 20 at 64s: eval_count=64 eval_duration_ns=2286036000
+[A76] run 21 at 67s: eval_count=64 eval_duration_ns=2288771000
+[A76] done at 70.42s

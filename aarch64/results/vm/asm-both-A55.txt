@@ -1,0 +1,10 @@
+[A55] guest up at 3.93s: 4 vCPU, CPU part 0xd05, MemTotal: 3056256 kB
+[A55] run 1 at 3s: [asm-llm] decode : 64 tok in 9846.29 ms (6.40 tok/s, threads=4, a55=4)
+[A55] run 2 at 24s: [asm-llm] decode : 64 tok in 10385.00 ms (6.07 tok/s, threads=4, a55=4)
+[A55] run 3 at 42s: [asm-llm] decode : 64 tok in 10162.86 ms (6.20 tok/s, threads=4, a55=4)
+[A55] run 4 at 59s: [asm-llm] decode : 64 tok in 11008.88 ms (5.72 tok/s, threads=4, a55=4)
+[A55] run 5 at 77s: [asm-llm] decode : 64 tok in 10774.64 ms (5.85 tok/s, threads=4, a55=4)
+[A55] run 6 at 95s: [asm-llm] decode : 64 tok in 11475.82 ms (5.49 tok/s, threads=4, a55=4)
+[A55] run 7 at 115s: [asm-llm] decode : 64 tok in 11833.15 ms (5.32 tok/s, threads=4, a55=4)
+[A55] run 8 at 135s: [asm-llm] decode : 64 tok in 9845.01 ms (6.40 tok/s, threads=4, a55=4)
+[A55] done at 153.19s
