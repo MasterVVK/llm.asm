@@ -38,7 +38,7 @@ Bare-metal OS in a diskless Proxmox VM on the same host (`results/proxmox-os-vm2
 ## Limitations
 
 - Prefill runs token by token, so it is 1.5–4× slower than llama.cpp. With long prompts llama.cpp wins on total time.
-- Qwen3-0.6B only: the architecture is hard-coded, the context is limited to 2048 tokens, and there is no GPU support or network API.
+- The measurements above are for Qwen3-0.6B. The Linux engine and bootable guest also support one specific [LiquidAI/LFM2-700M checkpoint](LFM2.md); its model format, context limit and measurements are separate. Neither engine has a GPU backend or network API.
 - **The bare-metal OS keeps all of its vCPUs at 100% even when idle**: worker cores wait in a `pause` loop and there is no `hlt`. On a shared hypervisor, run it only while you use it.
 - Under Linux, do not set `-t` above the number of free cores. The default is 32 threads, and on a busy machine throughput drops by more than an order of magnitude (upstream issues #9 and #10).
 - F16C is required for the FP16 block scales, so Sandy Bridge (Xeon E5 v1) is not supported.
