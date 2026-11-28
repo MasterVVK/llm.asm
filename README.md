@@ -4,7 +4,7 @@
 >
 > This fork runs llm.asm on CPUs without AVX2/FMA, such as Xeon E5 v2. · Этот форк запускает llm.asm на процессорах без AVX2/FMA, например Xeon E5 v2. · 本分支让 llm.asm 可在不支持 AVX2/FMA 的处理器（如至强 E5 v2）上运行。
 
-[Native LFM2-700M support on Ivy Bridge](ivybridge/LFM2.md): Linux CLI and bare-metal guest, with export and reference checks.
+[Native LFM2-700M support on Ivy Bridge](ivybridge/LFM2.md): Linux CLI and bare-metal guest, with export and reference checks. · Поддержка LFM2-700M на Ivy Bridge: Linux-версия и загрузочная ОС, с проверкой экспорта и сверкой с эталоном. · 在 Ivy Bridge 上原生支持 LFM2-700M：Linux 命令行版本和裸机系统，附导出检查与参考对比。
 
 **Three complete LLM projects written in 100% pure x86-64 NASM assembly.**
 Zero C, zero C++, zero Rust, zero libc, zero libm, zero runtime dependencies.
